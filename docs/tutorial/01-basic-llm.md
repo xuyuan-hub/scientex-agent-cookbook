@@ -11,25 +11,6 @@
 
 ## 设计思路
 
-### 为什么直接上 OpenAI SDK
-
-```python
-# ❌ 不要这样手写 HTTP
-import requests
-resp = requests.post("https://api.openai.com/v1/chat/completions", ...)
-
-# ✅ 直接用官方 SDK
-from openai import OpenAI
-client = OpenAI()
-resp = client.chat.completions.create(model="gpt-4o", messages=[...])
-```
-
-理由：
-1. 自动处理重试、超时、错误
-2. 类型提示完整，IDE 友好
-3. 统一的 streaming 接口
-4. 很多非 OpenAI 厂商也兼容 OpenAI 接口格式（DeepSeek, OpenRouter, Ollama 等）
-
 ### 本次调用的最小可行代码
 
 ```
@@ -40,7 +21,16 @@ resp = client.chat.completions.create(model="gpt-4o", messages=[...])
 
 ## 实现
 
-### 1. 新建文件：src/scientex_agent/llm_client.py
+### 1. 添加openai 模块
+
+```bash
+uv add openai
+
+# 国内可用清华源
+uv add openai --index-url=https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+### 2. 新建文件：src/scientex_agent/llm_client.py
 
 ```python
 """Minimal LLM client using OpenAI SDK."""
@@ -74,7 +64,7 @@ def get_client() -> OpenAI:
 
 def get_default_model() -> str:
     """Return the default model name from env or a reasonable default."""
-    return os.environ.get("DEEPSEEK_MODEL") or os.environ.get("OPENAI_MODEL") or "deepseek-chat"
+    return os.environ.get("DEEPSEEK_MODEL") or os.environ.get("OPENAI_MODEL") or "deepseek-v4-pro"
 
 
 def chat(prompt: str, *, model: str | None = None) -> str:
@@ -98,7 +88,9 @@ def chat(prompt: str, *, model: str | None = None) -> str:
     return response.choices[0].message.content or ""
 ```
 
-### 2. 更新 src/scientex_agent/cli.py
+> 📄 最新代码：[code/01-basic-llm/src/scientex_agent/llm_client.py](../../code/01-basic-llm/src/scientex_agent/llm_client.py)
+
+### 3. 更新 src/scientex_agent/cli.py
 
 ```python
 """CLI entry point."""
@@ -135,6 +127,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.print_help()
     return 1
 ```
+
+> 📄 最新代码：[code/01-basic-llm/src/scientex_agent/cli.py](../../code/01-basic-llm/src/scientex_agent/cli.py)
 
 ## 验证
 
@@ -185,6 +179,7 @@ response = client.chat.completions.create(
 ```
 
 `response` 对象结构：
+
 ```python
 response.choices[0].message.content  # 回复文本
 response.choices[0].message.role     # "assistant"
@@ -195,12 +190,17 @@ response.model                       # 实际使用的模型名
 
 ### 常见模型
 
-| 模型 | 厂商 | 特点 |
-|---|---|---|
-| `gpt-4o` | OpenAI | 最强综合能力 |
-| `gpt-4o-mini` | OpenAI | 快速便宜 |
-| `deepseek-chat` | DeepSeek | 性价比高 |
-| `claude-sonnet-5` | Anthropic | 长上下文，科学场景好 |
+| 模型                | 厂商          | 特点                    | 文档                                                                                                                                                                              |
+| ------------------- | ------------- | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gpt-5.6-sol`     | OpenAI        | 最新旗舰，复杂推理/编程 | [docs](https://platform.openai.com/docs/)                                                                                                                                          |
+| `gpt-5.6-terra`   | OpenAI        | 均衡版，速度与成本适中  |                                                                                                                                                                                   |
+| `gpt-5.6-luna`    | OpenAI        | 快速便宜，高吞吐任务    |                                                                                                                                                                                   |
+| `deepseek-v4-pro` | DeepSeek      | 最新旗舰，性价比高      | [docs](https://api-docs.deepseek.com/)                                                                                                                                             |
+| `deepseek-chat`   | DeepSeek      | 通用对话                |                                                                                                                                                                                   |
+| `glm-5.2`         | 智谱 AI (GLM) | 最新旗舰，1M 上下文     | [docs](https://docs.bigmodel.cn/cn/guide/develop/python/introduction)                                                                                                              |
+| `qwen3.7-max`     | 阿里百炼      | 旗舰模型，Agent 能力强  | [docs](https://bailian.console.aliyun.com/cn-beijing?utm_content=se_1021228199&gclid=EAIaIQobChMI-P-Z-vDglQMVplUPAh1H-BqUEAAYASAAEgIdbvD_BwE&tab=api#/api/?type=model&url=3016807) |
+| `qwen3.7-plus`    | 阿里百炼      | 效果/速度/成本均衡      |                                                                                                                                                                                   |
+| `claude-sonnet-5` | Anthropic     | 长上下文，科学场景好    |                                                                                                                                                                                   |
 
 注意：Anthropic 和 Gemini 不兼容 OpenAI 接口，后续步骤会处理。
 
