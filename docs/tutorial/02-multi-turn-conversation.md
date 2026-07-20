@@ -33,19 +33,19 @@ history = [
 ]
 # 把完整历史传给 LLM
 response = client.chat.completions.create(
-    model="deepseek-chat",
+    model="deepseek-v4-pro",
     messages=history,  # ← 关键：传完整历史
 )
 ```
 
 ### 消息角色的含义
 
-| role | 含义 | 例子 |
-|---|---|---|
-| `system` | 系统指令，定义 AI 行为 | "你是一个有帮助的助手" |
-| `user` | 用户说的话 | "你好" |
-| `assistant` | AI 的回复 | "你好！有什么可以帮你的？" |
-| `tool` | 工具执行结果 | （后续步骤会用到） |
+| role          | 含义                   | 例子                       |
+| ------------- | ---------------------- | -------------------------- |
+| `system`    | 系统指令，定义 AI 行为 | "你是一个有帮助的助手"     |
+| `user`      | 用户说的话             | "你好"                     |
+| `assistant` | AI 的回复              | "你好！有什么可以帮你的？" |
+| `tool`      | 工具执行结果           | （后续步骤会用到）         |
 
 ### 封装为 ChatSession 类
 
@@ -65,27 +65,35 @@ ChatSession
 ```python
 """LLM chat session with conversation history."""
 
+
 from __future__ import annotations
 
 import os
 
 from openai import OpenAI
 
-
 def get_client() -> OpenAI:
+    """Create an OpenAI client from environment variables.
+
+    Priority: DEEPSEEK_* > OPENAI_* (easy to override).
+    """
+    # DeepSeek – https://api-docs.deepseek.com/
     if os.environ.get("DEEPSEEK_API_KEY"):
         return OpenAI(
             api_key=os.environ["DEEPSEEK_API_KEY"],
             base_url="https://api.deepseek.com/v1",
         )
+    # OpenAI – https://platform.openai.com/docs/
     if os.environ.get("OPENAI_API_KEY"):
         return OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-    raise RuntimeError("No API key found.")
 
+    raise RuntimeError(
+        "No LLM API key found. Set DEEPSEEK_API_KEY or OPENAI_API_KEY."
+    )
 
 def get_default_model() -> str:
-    return os.environ.get("DEEPSEEK_MODEL") or os.environ.get("OPENAI_MODEL") or "deepseek-chat"
-
+    """Return the default model name from env or a reasonable default."""
+    return os.environ.get("DEEPSEEK_MODEL") or os.environ.get("OPENAI_MODEL") or "deepseek-v4-pro"
 
 class ChatSession:
     """A conversation session that maintains message history.
@@ -99,22 +107,22 @@ class ChatSession:
     """
 
     def __init__(
-        self,
-        model: str | None = None,
-        client: OpenAI | None = None,
-    ) -> None:
+            self,
+            model: str | None = None,
+            client: OpenAI | None = None,
+            )-> None:
         self.client = client or get_client()
         self.model = model or get_default_model()
         self.messages: list[dict[str, str]] = []
 
-    def system(self, content: str) -> None:
+    def system(self, content:str)->None:
         """Set or replace the system prompt (always at position 0)."""
         if self.messages and self.messages[0]["role"] == "system":
             self.messages[0] = {"role": "system", "content": content}
         else:
             self.messages.insert(0, {"role": "system", "content": content})
 
-    def send(self, content: str, **kwargs) -> str:
+    def send(self, content: str,**kwargs)->str:
         """Send a user message and return the assistant reply.
 
         The message pair (user + assistant) is appended to history.
@@ -126,7 +134,7 @@ class ChatSession:
         Returns:
             The assistant's response text.
         """
-        # Append user message
+        # Append use message
         self.messages.append({"role": "user", "content": content})
 
         # Call LLM with full history
@@ -153,18 +161,40 @@ class ChatSession:
         system_msg = self.messages[0] if self.messages and self.messages[0]["role"] == "system" else None
         self.messages = [system_msg] if system_msg else []
 
-    def clone(self) -> "ChatSession":
-        """Create a copy with the same config and history."""
-        new = ChatSession(model=self.model, client=self.client)
-        new.messages = list(self.messages)
-        return new
+def chat(prompt: str, *, model: str | None = None) -> str:
+    """Send a single message and return the response text.
+
+    Args:
+        prompt: The user's message.
+        model: Model name. Uses default if not specified.
+
+    Returns:
+        The assistant's text response.
+    """
+    client = get_client()
+    model_name = model or get_default_model()
+
+    response = client.chat.completions.create(
+        model=model_name,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    return response.choices[0].message.content or ""
 ```
+
+> 📄 最新代码：[code/02-multi-turn-conversation/src/scientex_agent/llm_client.py](../../code/02-multi-turn-conversation/src/scientex_agent/llm_client.py)
 
 ### 2. 更新 CLI
 
 ```python
-# src/scientex_agent/cli.py 中的 chat 子命令
-# 增加交互式 REPL
+"""CLI entry point."""
+
+from __future__ import annotations
+
+import argparse
+
+from . import __version__
+from .llm_client import chat
 
 def _interactive_chat(args) -> int:
     """Interactive chat REPL."""
@@ -202,7 +232,38 @@ def _interactive_chat(args) -> int:
         print()
 
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="scientex_agent")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    # chat 子命令
+    chat_parser = subparsers.add_parser("chat", help="Send a message to the LLM")
+    chat_parser.add_argument("message", nargs="*", help="The message to send")
+    chat_parser.add_argument("--model", help="Model to use")
+    chat_parser.add_argument("--interactive", action="store_true", help="Start an interactive chat session")
+    chat_parser.add_argument("--system", help="System prompt for interactive mode")
+
+    args = parser.parse_args(argv)
+
+    if args.command == "chat":
+        if args.interactive:
+            return _interactive_chat(args)
+        prompt = " ".join(args.message)
+        print(f"> {prompt}")
+        print()
+        response = chat(prompt, model=args.model)
+        print(response)
+        return 0
+  
+    parser.print_help()
+    return 1
 ```
+
+> 📄 最新代码：[code/02-multi-turn-conversation/src/scientex_agent/cli.py](../../code/02-multi-turn-conversation/src/scientex_agent/cli.py)
 
 ## 验证
 
