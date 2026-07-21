@@ -178,15 +178,76 @@ response = client.chat.completions.create(
 )
 ```
 
-`response` 对象结构：
+### LLM 返回的完整 response 对象（真实案例）
+
+调用 `client.chat.completions.create()` 后，拿到的是一个很大的对象。如果你直接 `print(response)`，会看到这样的内容：
 
 ```python
-response.choices[0].message.content  # 回复文本
-response.choices[0].message.role     # "assistant"
-response.usage.prompt_tokens         # 输入 token 数
-response.usage.completion_tokens     # 输出 token 数
-response.model                       # 实际使用的模型名
+ChatCompletion(
+    id='b564763b-6e2c-48aa-bfc4-195cbab5fbae',
+    choices=[
+        Choice(
+            finish_reason='stop',
+            index=0,
+            logprobs=None,
+            message=ChatCompletionMessage(
+                content='你好！😊 很高兴见到你！\n\n我是DeepSeek，你的免费AI助手，可以帮你解答问题、提供建议、处理文档、进行创作等等。有什么我可以帮你的吗？不管是闲聊还是正经问题，都欢迎随时告诉我哦~',
+                refusal=None,
+                role='assistant',
+                annotations=None,
+                audio=None,
+                function_call=None,
+                tool_calls=None,
+                reasoning_content='嗯，用户发来一个简单的问候"你好"。\n\n这是一个非常基础的社交开场，没有提出任何具体问题或指令。\n\n我需要给出一个友好、热情的回应，建立良好的互动开端。可以用问候语加上自我介绍，并开放性地邀请用户提出任何需求，这样既回应了问候，又引导对话继续。'
+            )
+        )
+    ],
+    created=1784612358,
+    model='deepseek-v4-pro',
+    object='chat.completion',
+    usage=CompletionUsage(
+        completion_tokens=159,
+        prompt_tokens=5,
+        total_tokens=164,
+        completion_tokens_details=CompletionTokensDetails(
+            reasoning_tokens=106
+        )
+    )
+)
 ```
+
+**这就是 `response` 的全貌。** 它是一个嵌套的对象，包含了：
+
+| 层级 | 路径 | 含义 |
+|------|------|------|
+| 顶层 | `response.id` | 本次请求的唯一 ID |
+| 顶层 | `response.model` | 实际使用的模型名 |
+| 顶层 | `response.created` | 创建时间（Unix 时间戳） |
+| choices | `response.choices[0]` | 回复列表（通常只有 1 个） |
+| message | `response.choices[0].message.content` | **← 我们最关心的回复文本** |
+| message | `response.choices[0].message.role` | 回复角色，固定为 `"assistant"` |
+| message | `response.choices[0].message.reasoning_content` | 模型的思考过程（部分模型有） |
+| usage | `response.usage.prompt_tokens` | 输入 token 数 |
+| usage | `response.usage.completion_tokens` | 输出 token 数 |
+| usage | `response.usage.total_tokens` | 总 token 数 |
+
+### 为什么是 `response.choices[0].message.content`？
+
+```
+response
+  └── choices          # 列表，支持一次返回多个回复（通常只有 1 个）
+        └── [0]        # 取第一个回复
+            └── message  # 回复的消息对象
+                └── content  # 消息的文本内容 ← 这就是我们要的
+```
+
+所以代码里写的是：
+
+```python
+return response.choices[0].message.content or ""
+```
+
+`or ""` 是为了防止 `content` 为 `None` 时返回空字符串。
 
 ### 常见模型
 

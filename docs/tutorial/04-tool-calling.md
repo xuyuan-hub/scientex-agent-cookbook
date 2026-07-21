@@ -49,33 +49,34 @@ LLM (with tools):  → 决定调用 get_current_time()
 tool_schema = {
     "type": "function",
     "function": {
-        "name": "get_current_time",
-        "description": "Get the current time in a given timezone.",
+        "name": "caculate",
+        "description": "Evaluate a mathematical expression. Supports +,-,*,/,** and common math functions.",
         "parameters": {
             "type": "object",
             "properties": {
-                "timezone": {
+                "expression": {
                     "type": "string",
-                    "description": "IANA timezone name, e.g. 'Asia/Shanghai'"
+                    "description": "A Python math expression, e.g. '2 + 3 * 4' or 'sqrt(16)'"
                 }
             },
-            "required": ["timezone"]
+            "required": ["expression"]
         }
     }
 }
 
 # 2. LLM 返回的 tool call（告诉我们要执行什么）
 # response.choices[0].message.tool_calls = [
-#     ToolCall(id="call_123", name="get_current_time", arguments='{"timezone":"Asia/Shanghai"}')
+#     ToolCall(id="call_123", name="caculate", arguments='{"expression":"3**10"}')
 # ]
 
 # 3. 我们把执行结果回传给 LLM（tool role message）
-# {"role": "tool", "tool_call_id": "call_123", "content": "2026-07-20T15:30:00+08:00"}
+# {"role": "tool", "tool_call_id": "call_123", "content": "{\"ok\": true, \"result\": 59049}"}
 ```
 
 ### 多轮工具调用的挑战
 
 LLM 可能在一轮中调用多个工具，或者多轮连续调用：
+
 ```
 用户: "搜索 covid 相关论文，然后翻译第一篇的标题"
   → Round 1: LLM calls search_papers("covid")
@@ -193,8 +194,13 @@ class ToolRegistry:
 
 # === Built-in Tools ===
 
-def register_default_tools(registry: ToolRegistry) -> None:
-    """Register a set of basic utility tools."""
+def registry_default_tools(registry: ToolRegistry | None = None) -> ToolRegistry:
+    """Register a set of basic utility tools and return the registry.
+
+    If *registry* is ``None`` a fresh :class:`ToolRegistry` is created.
+    """
+    if registry is None:
+        registry = ToolRegistry()
 
     @registry.register(
         name="get_current_time",
@@ -210,33 +216,33 @@ def register_default_tools(registry: ToolRegistry) -> None:
             "required": ["timezone"],
         },
     )
-    def get_current_time(timezone: str) -> str:
-        from datetime import datetime
+    def get_current_time(timezone:str) -> str:
+        from datetime import datetime, timezone
         from zoneinfo import ZoneInfo
 
         try:
             tz = ZoneInfo(timezone)
             now = datetime.now(tz)
-            return now.strftime("%Y-%m-%d %H:%M:%S %Z")
+            return now.strftime("%Y-%m-%d %H:%M:%S%Z")
         except Exception:
             # Fallback to UTC
-            return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+            return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S%Z")
 
     @registry.register(
-        name="calculate",
-        description="Evaluate a mathematical expression. Supports +, -, *, /, **, and common math functions.",
+        name="caculate",
+        description="Evaluate a mathematical expression. Supports +,-,*,/,** and common math functions.",
         parameters={
-            "type": "object",
-            "properties": {
-                "expression": {
-                    "type": "string",
-                    "description": "A Python math expression, e.g. '2 + 3 * 4' or 'sqrt(16)'"
-                }
+            "type":"object",
+            "properties":{
+                "expression":{
+                    "type":"string",
+                    "description":"A Python math expression, e.g. '2 + 3 * 4' or 'sqrt(16)'"
+                },
             },
-            "required": ["expression"],
+            "required":["expression"]
         },
     )
-    def calculate(expression: str) -> float | str:
+    def caculate(expression:str) -> float |str:
         import math
 
         # Safe eval: only allow math functions, numbers, and basic operators
@@ -248,11 +254,129 @@ def register_default_tools(registry: ToolRegistry) -> None:
             "pi": math.pi, "e": math.e,
         }
         try:
-            result = eval(expression, {"__builtins__": {}}, allowed_names)
+            result = eval(expression,{"__builtin__":{}},allowed_names)
             return result
         except Exception as e:
             return f"Error: {e}"
+    return registry
 ```
+
+> 📄 最新代码：[code/04-tool-calling/src/scientex_agent/tools.py](../../code/04-tool-calling/src/scientex_agent/tools.py)
+
+#### 代码详解
+
+**1. `from __future__ import annotations` 的作用**
+
+这是 Python 的一个特殊导入，让类型注解延迟求值。好处是：
+
+- 可以在类型注解中引用还没定义的类名（前向引用），不用加引号
+- 提升模块加载性能（注解不会立即求值）
+
+```python
+# 没有 __future__ 时，引用自身类名需要加引号：
+def send(self) -> "ChatSession": ...
+
+# 有了 __future__ 后，直接写：
+def send(self) -> ChatSession: ...
+```
+
+**2. `tool_schema` 函数**
+
+这个函数很简单，就是把工具的名称、描述、参数打包成 OpenAI API 需要的格式：
+
+```python
+# 输入
+tool_schema("caculate", "计算表达式", {"type": "object", ...})
+
+# 输出（OpenAI API 需要的格式）
+{
+    "type": "function",
+    "function": {
+        "name": "caculate",
+        "description": "计算表达式",
+        "parameters": {...}
+    }
+}
+```
+
+**3. `ToolRegistry` 类的装饰器模式（难点）**
+
+`register` 方法使用了一个**装饰器工厂**（decorator factory）模式，这是 Python 中比较高级的用法。让我们拆解：
+
+```python
+def register(self, name, description, parameters):
+    # 这是一个"装饰器工厂"——它返回一个装饰器
+  
+    def decorator(func):
+        # 这是真正的装饰器
+        self._handlers[name] = func          # 保存函数本身
+        self._schemas.append(...)            # 保存工具的 schema
+        return func                          # 返回原函数（不修改它）
+  
+    return decorator  # 返回装饰器
+```
+
+**执行流程图解：**
+
+```python
+@registry.register("caculate", "计算表达式", {...})
+def caculate(expression: str):
+    return eval(expression)
+```
+
+等价于：
+
+```python
+# 第 1 步：调用 register，返回 decorator 函数
+decorator = registry.register("caculate", "计算表达式", {...})
+
+# 第 2 步：用 decorator 装饰 caculate 函数
+caculate = decorator(caculate)
+```
+
+在 `decorator(caculate)` 执行时：
+
+1. 把 `caculate` 函数存到 `self._handlers["caculate"]`
+2. 把工具的 schema 存到 `self._schemas` 列表
+3. 返回原来的 `caculate` 函数（函数本身不变）
+
+这样，`caculate` 函数就被"注册"了——我们可以在需要时通过名字找到它并调用。
+
+**4. `execute` 方法中的 `**arguments`**
+
+```python
+result = handler(**arguments)
+```
+
+`**` 是 Python 的"解包"操作符。假设：
+
+```python
+handler = caculate  # 函数定义：def caculate(expression: str)
+arguments = {"expression": "2 + 3"}
+
+# handler(**arguments) 等价于：
+handler(expression="2 + 3")
+# 也就是：
+caculate(expression="2 + 3")
+```
+
+`**arguments` 把字典的键值对"解包"成关键字参数传给函数。这样我们就能用字典动态地调用任意函数。
+
+**5. `caculate` 函数中的安全 eval**
+
+```python
+eval(expression, {"__builtin__": {}}, allowed_names)
+```
+
+`eval()` 可以执行字符串形式的 Python 表达式，但直接用它很危险（用户可能执行恶意代码）。这里用三个参数限制它：
+
+| 参数                    | 作用                                                   |
+| ----------------------- | ------------------------------------------------------ |
+| `expression`          | 要执行的表达式字符串                                   |
+| `{"__builtin__": {}}` | 禁用所有内置函数（如`open`, `exec`），防止危险操作 |
+| `allowed_names`       | 只允许使用白名单中的函数（如`sqrt`, `sin`）        |
+
+这样，用户只能做数学计算，不能执行危险操作。
 
 ### 2. 创建 src/scientex_agent/agent_loop.py
 
@@ -397,6 +521,7 @@ def chat_with_tools_stream(
                         tool_calls_data[idx] = {
                             "id": tc_delta.id or "",
                             "function": {"name": "", "arguments": ""},
+                            "type": "function",
                         }
                     if tc_delta.id:
                         tool_calls_data[idx]["id"] = tc_delta.id
@@ -430,18 +555,156 @@ def chat_with_tools_stream(
     return
 ```
 
-### 3. 更新 ChatSession
+> 📄 最新代码：[code/04-tool-calling/src/scientex_agent/agent_loop.py](../../code/04-tool-calling/src/scientex_agent/agent_loop.py)
+
+#### 代码详解
+
+**1. `_execute_tool_calls` 函数**
+
+这个函数负责批量执行 LLM 返回的所有工具调用：
+
+```python
+for tc in response.choices[0].message.tool_calls or []:
+```
+
+- `response.choices[0].message.tool_calls` 是 LLM 返回的工具调用列表
+- `or []` 是为了防止 `tool_calls` 为 `None` 时报错（如果 LLM 没有调用工具）
+
+```python
+args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+```
+
+- LLM 返回的参数是 JSON 字符串（如 `'{"expression": "2+3"}'`）
+- `json.loads()` 把它解析成 Python 字典（如 `{"expression": "2+3"}`）
+
+**2. `chat_with_tools` 函数的核心循环**
+
+```python
+for _ in range(max_rounds):
+    response = client.chat.completions.create(...)
+  
+    if not msg.tool_calls:
+        return msg.content  # LLM 没有调用工具 → 返回最终回复
+  
+    # 有工具调用 → 执行工具 → 把结果加入 messages → 继续循环
+    messages.append(assistant_msg_with_tool_calls)
+    messages.extend(tool_results)
+```
+
+这个循环实现了：
+
+1. 发送消息给 LLM
+2. 如果 LLM 返回文本（没有调用工具）→ 结束
+3. 如果 LLM 调用工具 → 执行工具 → 把结果追加到消息历史 → 再次调用 LLM
+4. 最多循环 `max_rounds` 次（防止无限循环）
+
+**3. 函数签名中的 `*` 和 `**kwargs`**
+
+```python
+def chat_with_tools(
+    client: OpenAI,
+    model: str,
+    messages: list[dict],
+    registry: ToolRegistry,
+    *,                    # ← 这个星号
+    max_rounds: int = 10,
+    **kwargs,             # ← 这个双星号
+) -> str:
+```
+
+| 符号         | 含义                                        |
+| ------------ | ------------------------------------------- |
+| `*`        | 后面的参数必须用关键字传参（不能按位置传）  |
+| `**kwargs` | 接收任意额外的关键字参数，会透传给 API 调用 |
+
+```python
+# 调用示例
+chat_with_tools(
+    client, "gpt-4", messages, registry,
+    max_rounds=5,           # 必须用关键字（因为有 *）
+    temperature=0.7,        # 通过 **kwargs 传给 API
+)
+```
+
+**4. 流式工具调用的难点：聚合 chunk**
+
+流式模式下，一个工具调用的数据会分散在多个 chunk 中：
+
+```
+chunk 1: tool_calls[0].function.name = "get_"
+chunk 2: tool_calls[0].function.name = "current_"
+chunk 3: tool_calls[0].function.name = "time"
+chunk 4: tool_calls[0].function.arguments = '{"timezone":"A'
+chunk 5: tool_calls[0].function.arguments = 'sia/Shanghai"}'
+```
+
+代码用 `tool_calls_data` 字典来聚合：
+
+```python
+tool_calls_data: dict[int, dict] = {}
+
+for chunk in stream:
+    if delta.tool_calls:
+        for tc_delta in delta.tool_calls:
+            idx = tc_delta.index  # 第几个工具调用
+        
+            # 第一次见到这个 index，初始化
+            if idx not in tool_calls_data:
+                tool_calls_data[idx] = {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
+        
+            # 累加数据（字符串拼接）
+            if tc_delta.function.name:
+                tool_calls_data[idx]["function"]["name"] += tc_delta.function.name
+            if tc_delta.function.arguments:
+                tool_calls_data[idx]["function"]["arguments"] += tc_delta.function.arguments
+```
+
+最终 `tool_calls_data` 会变成：
+
+```python
+{
+    0: {
+        "id": "call_abc123",
+        "type": "function",
+        "function": {
+            "name": "get_current_time",
+            "arguments": '{"timezone":"Asia/Shanghai"}'
+        }
+    }
+}
+```
+
+**5. `Generator[str, None, None]` 类型注解**
+
+```python
+def chat_with_tools_stream(...) -> Generator[str, None, None]:
+```
+
+这是生成器函数的返回类型：
+
+- 第一个 `str`：`yield` 产出的值的类型
+- 第二个 `None`：`send()` 发送的值的类型（通常为 None）
+- 第三个 `None`：`return` 返回的值的类型（通常为 None）
+
+### 3. 更新 ChatSession（统一管理对话）
+
+为了让 `cli.py` 不需要直接和 `agent_loop` 打交道，我们在 `ChatSession` 中封装了工具调用方法。这样所有对话逻辑（普通对话、流式对话、工具调用）都由 `ChatSession` 统一管理。
 
 ```python
 # 在 llm_client.py 中更新 ChatSession：
 
 class ChatSession:
-    # ... 之前的代码 ...
+    # ... 之前的 send(), send_stream() 方法 ...
+
+    def __init__(self, model: str | None = None, client: OpenAI | None = None) -> None:
+        self.client = client or get_client()
+        self.model = model or get_default_model()
+        self.registry = registry_default_tools()
+        self.messages: list[dict[str, str]] = []
 
     def send_with_tools(
         self,
         content: str,
-        registry: "ToolRegistry",
         **kwargs,
     ) -> str:
         """Send a message with tool calling support."""
@@ -450,7 +713,7 @@ class ChatSession:
         self.messages.append({"role": "user", "content": content})
 
         reply = chat_with_tools(
-            self.client, self.model, self.messages, registry, **kwargs
+            self.client, self.model, self.messages, self.registry, **kwargs
         )
 
         # Check if reply is already in messages (from tool loop)
@@ -465,7 +728,6 @@ class ChatSession:
     def send_with_tools_stream(
         self,
         content: str,
-        registry: "ToolRegistry",
         **kwargs,
     ) -> Generator[str, None, None]:
         """Streaming version with tool calling."""
@@ -475,7 +737,7 @@ class ChatSession:
 
         full_reply = ""
         for token in chat_with_tools_stream(
-            self.client, self.model, self.messages, registry, **kwargs
+            self.client, self.model, self.messages, self.registry, **kwargs
         ):
             full_reply += token
             yield token
@@ -488,27 +750,69 @@ class ChatSession:
             self.messages.append({"role": "assistant", "content": full_reply})
 ```
 
+> 📄 最新代码：[code/04-tool-calling/src/scientex_agent/llm_client.py](../../code/04-tool-calling/src/scientex_agent/llm_client.py)
+
+#### 架构说明
+
+```
+cli.py（只和 ChatSession 交互）
+  │
+  └── ChatSession（统一管理对话）
+        ├── send()                 # 普通对话
+        ├── send_stream()          # 流式对话
+        ├── send_with_tools()      # 工具调用 ← 本章新增
+        └── send_with_tools_stream()  # 流式工具调用 ← 本章新增
+              │
+              └── agent_loop.py（内部实现，cli.py 不直接感知）
+                    ├── chat_with_tools()
+                    └── chat_with_tools_stream()
+```
+
+**好处：**
+
+- `cli.py` 只需要导入 `ChatSession`，不需要知道 `agent_loop` 的存在
+- 工具调用和普通对话的接口一致（都通过 `session` 对象）
+- 未来添加新功能（如 MCP）只需扩展 `ChatSession`
+
 ## 验证
 
-```python
-from scientex_agent.llm_client import ChatSession
-from scientex_agent.tools import ToolRegistry, register_default_tools
+工具在 `ChatSession.__init__` 里通过 `registry_default_tools()` 自动注册，CLI 不需要额外开关：
 
-# Setup
-registry = ToolRegistry()
-register_default_tools(registry)
+### 1. 通过 CLI 交互式模式测试
 
-session = ChatSession()
-session.system("你是一个助手。可以用 calculate 工具计算，用 get_current_time 获取时间。")
+```bash
+uv run scientex_agent chat --interactive
+```
 
-# 测试工具调用
-reply = session.send_with_tools("3 的 10 次方是多少？", registry)
-print(reply)
-# 预期：LLM 调用 calculate("3**10") → 结果 59049 → 回复包含 59049
+进入后输入：
 
-reply = session.send_with_tools("现在北京时间几点？", registry)
-print(reply)
-# 预期：LLM 调用 get_current_time("Asia/Shanghai") → 回复当前时间
+```
+> 3 的 10 次方是多少？
+```
+
+预期：LLM 调用 `caculate("3**10")` → 得到 59049 → 回复包含结果
+
+```
+> 现在北京时间几点？
+```
+
+预期：LLM 调用 `get_current_time("Asia/Shanghai")` → 回复当前时间
+
+```
+> /exit
+```
+
+### 2. 指定 system prompt
+
+```bash
+uv run scientex_agent chat --interactive \
+  --system "你是一个助手。可以用 caculate 工具计算，用 get_current_time 获取时间。"
+```
+
+### 3. 关闭流式输出
+
+```bash
+uv run scientex_agent chat --interactive --no-stream
 ```
 
 ## 深入理解
@@ -566,3 +870,8 @@ chunk 5:  delta.tool_calls = [{"index": 0, "function": {"arguments": 'sia/Shangh
 ## 下一步
 
 → [05-multi-provider.md](05-multi-provider.md)
+
+## 参考资料
+
+- [OpenAI Function Calling 官方文档](https://platform.openai.com/docs/guides/function-calling)
+- [DeepSeek Tool Calls 官方文档](https://api-docs.deepseek.com/guides/tool_calls)
