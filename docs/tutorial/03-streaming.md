@@ -154,7 +154,7 @@ def _interactive_chat(args) -> int:
     print("Commands: /exit, /clear, /nostream")
     print()
 
-    use_stream = not args.no_stream
+    use_stream = args.stream
 
     while True:
         try:
@@ -167,11 +167,7 @@ def _interactive_chat(args) -> int:
             break
         if user_input.lower() == "/clear":
             session.clear()
-            print("[History cleared]")
-            continue
-        if user_input.lower() == "/nostream":
-            use_stream = not use_stream
-            print(f"[Streaming: {'ON' if use_stream else 'OFF'}]")
+            print("History cleared")
             continue
         if not user_input.strip():
             continue
@@ -243,7 +239,7 @@ Python 的 `print()` 默认有缓冲。在终端中可能每隔几行才刷新�
 stream_options={"include_usage": True}
 ```
 
-此选项让 `deepseek-chat` 和 `gpt-4o` 在流式响应中附带 token 用量信息。
+此选项让 `deepseek-v4-pro` 在流式响应中附带 token 用量信息。
 注意：并非所有模型都支持（有些会报错），后续步骤会处理兼容性。
 
 ## 当前局限
