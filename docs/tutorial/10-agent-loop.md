@@ -425,14 +425,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from langchain_openai import ChatOpenAI
-
 from .agent_graph import AgentGraph, convert_tools_for_langgraph
 from .metadata import MetadataStore
 from .skill_catalog import SkillCatalog
 from .tools import ToolRegistry, register_default_tools, register_skill_tools
 from .kernel import SubprocessPythonKernel
-from .provider_registry import ProviderRegistry
+from .providers import build_default_registry
+from .provider_registry import LangChainLLMProvider
 
 
 class ScientexApp:
@@ -458,6 +457,7 @@ class ScientexApp:
         self.metadata = MetadataStore(self.data_dir / "app.db")
         self.skills = SkillCatalog()
         self.kernel: SubprocessPythonKernel | None = None
+        self.providers = build_default_registry()
         self._graph_cache: dict[str, AgentGraph] = {}
 
     def initialize(self) -> None:
@@ -496,12 +496,11 @@ class ScientexApp:
 
         langgraph_tools = convert_tools_for_langgraph(registry)
 
-        # Build LLM
-        llm = ChatOpenAI(
-            model=model_name,
-            temperature=0.7,
-            streaming=True,
-        )
+        # Build LLM from the provider selected in Step 05/06.
+        provider = self.providers.get(provider_name)
+        if not isinstance(provider, LangChainLLMProvider):
+            raise TypeError(f"{provider_name} does not support LangGraph yet")
+        llm = provider.to_langchain_chat_model(model_name, streaming=True)
 
         # Build graph
         graph = AgentGraph(llm=llm, tools=langgraph_tools)

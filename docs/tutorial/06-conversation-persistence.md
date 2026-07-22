@@ -8,6 +8,11 @@
 
 - 完成 [05-multi-provider.md](05-multi-provider.md)
 
+## 与 Step 05 的边界
+
+Step 05 已让 `ChatSession` 依赖 `LLMProvider`，并保留工具调用和流式能力。本章在同一个会话对象上
+增加 SQLite 持久化：恢复 Frame 后，继续使用它保存的 provider、model 和消息历史。
+
 ## 设计思路
 
 ### 为什么需要持久化
@@ -356,6 +361,8 @@ CREATE TABLE IF NOT EXISTS messages (
 ```python
 # 在 llm_client.py 中
 
+from .provider_registry import LLMProvider
+
 class PersistentChatSession(ChatSession):
     """ChatSession that persists messages to SQLite."""
 
@@ -364,9 +371,14 @@ class PersistentChatSession(ChatSession):
         frame_id: str,
         metadata: "MetadataStore",
         model: str | None = None,
-        client: OpenAI | None = None,
+        provider: LLMProvider | None = None,
+        provider_name: str | None = None,
     ) -> None:
-        super().__init__(model=model, client=client)
+        super().__init__(
+            model=model,
+            provider=provider,
+            provider_name=provider_name,
+        )
         self.frame_id = frame_id
         self.metadata = metadata
         # Restore existing messages
@@ -383,12 +395,18 @@ class PersistentChatSession(ChatSession):
             else:
                 self.messages.append({"role": role, "content": str(content)})
 
+    def _persist_new_messages(self, start: int) -> None:
+        for message in self.messages[start:]:
+            self.metadata.append_message(
+                frame_id=self.frame_id,
+                role=message["role"],
+                content=message["content"],
+            )
+
     def send(self, content: str, **kwargs) -> str:
-        self.metadata.append_message(
-            frame_id=self.frame_id, role="user", content=content
-        )
+        start = len(self.messages)
         reply = super().send(content, **kwargs)
-        # Already appended in super().send()
+        self._persist_new_messages(start)  # 保存 user 和 assistant 两条消息
         return reply
 ```
 
