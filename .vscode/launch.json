@@ -1,0 +1,52 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug: chat (one-shot)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "scientex_agent",
+            "args": ["chat", "你好"],
+            "console": "integratedTerminal",
+            "envFile": "${workspaceFolder}/.env.local",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            }
+        },
+        {
+            "name": "Debug: chat (interactive)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "scientex_agent",
+            "args": ["chat", "--interactive"],
+            "console": "integratedTerminal",
+            "envFile": "${workspaceFolder}/.env.local",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            }
+        },
+        {
+            "name": "Debug: chat (interactive + tools)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "scientex_agent",
+            "args": ["chat", "--interactive"],
+            "console": "integratedTerminal",
+            "envFile": "${workspaceFolder}/.env.local",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            }
+        },
+        {
+            "name": "Debug: current file",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "envFile": "${workspaceFolder}/.env.local",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            }
+        }
+    ]
+}

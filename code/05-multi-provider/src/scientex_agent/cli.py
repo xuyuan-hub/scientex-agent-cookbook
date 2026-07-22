@@ -46,7 +46,7 @@ def _interactive_chat(args) -> int:
         else:
             reply = session.send_with_tools(user_input)
             print(reply)
-       
+
         print()
         print(f"[{len(session.messages)} messages in history]")
         print()

@@ -2,8 +2,7 @@
 
 ## 目标
 
-从零开始，渐进式构建一个本地科学 agent 平台（与当前 scientex_agent 功能对等），
-每一步都可以独立运行和验证，逐步叠加功能。
+从零开始，渐进式构建一个本地科学 agent 平台。每一步都在上一步的可运行代码上继续扩展。
 
 **核心理念**：
 - 先用最简单的代码把功能跑通，再重构优化
@@ -27,7 +26,7 @@
 
 - Python >= 3.11
 - `uv` 已安装（`pip install uv`）
-- 至少一个 LLM API Key（OpenAI / DeepSeek / Anthropic 任选其一）
+- 至少一个 OpenAI-compatible LLM API Key（Step 01 起需要；推荐 DeepSeek）
 
 ## 开发路线图
 
@@ -40,7 +39,7 @@ Phase 1: 基础通信 ───────────────────�
                                 │
 Phase 2: 工具与技能 ─────────────────────────────
   04  工具调用           function calling, tool loop
-  05  多提供商           Anthropic, Gemini, DeepSeek, Azure
+  05  多提供商支持       Adapter、registry、保留工具与流式的 provider 切换
   06  对话持久化         SQLite 存储消息, 可恢复
   07  MCP 集成           外部工具服务器, mcp SDK
   08  技能系统           文件型 SKILL.md 目录
@@ -60,11 +59,22 @@ Phase 5: 界面与领域 ──────────────────�
   16  生产化             备份恢复, 错误处理, 打包分发
 ```
 
+### 推荐学习顺序
+
+请按编号顺序学习：
+
+```
+00 → 01 → 02 → 03 → 04 → 05 → 06 → 07 → 08 → 09 → 10 → 11 …
+```
+
+Step 05 会把 adapter 接入已有的 `ChatSession` 与 tool loop，因此后续的持久化、MCP、技能和
+Agent 编排都建立在同一个多 provider 会话路径上。
+
 ## 如何使用
 
 ### 按顺序阅读
 
-每个文档独立可执行，建议按编号顺序阅读。每一步都有：
+每个文档都可以运行和验证。每一步都有：
 
 - **目标**：这一步要达成什么
 - **前置条件**：需要先完成哪些步骤
@@ -96,6 +106,10 @@ uv sync
 source .venv/bin/activate
 ```
 
+### 辅助教程
+
+- [Python `unittest` 入门](unittest-basics.md)：理解为什么要测试、如何运行测试，以及怎样用 fake 替代真实 API。
+
 ## 架构演进
 
 ```
@@ -103,15 +117,20 @@ Step 01-03: 脚本式的函数调用
   main()
     └── openai.chat.completions.create()
 
-Step 04-06: 引入类和状态
+Step 04: 工具调用
   ChatSession
     ├── messages: list
     ├── tools: list
     └── send() → response
 
-Step 07-09: 引入外部能力
-  MCPConnector, SkillCatalog, PythonKernel
-    └── 通过 ToolRegistry 接入 ChatSession
+Step 05: provider adapter 重构
+  ChatSession → LLMProvider
+  AgentLoop   → LLMProvider / StreamingLLMProvider
+  └── 保留普通、工具、流式接口
+
+Step 06-09: 引入持久化与外部能力
+  PersistentChatSession, MCPConnector, SkillCatalog, PythonKernel
+    └── 通过 ToolRegistry 接入 provider-backed ChatSession
 
 Step 10: 引入编排框架
   AgentGraph (LangGraph)
