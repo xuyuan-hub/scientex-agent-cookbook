@@ -69,7 +69,7 @@ uv sync
 | MCP 协议 | `mcp` 官方 SDK |
 | Web 框架 | `fastapi` + `uvicorn` |
 | 存储 | SQLite + 文件系统 |
-| 前端 | Vanilla JS SPA |
+| 前端 | Vue 3 + TypeScript + Vite SPA |
 | 包管理 | `uv` |
 
 ## License

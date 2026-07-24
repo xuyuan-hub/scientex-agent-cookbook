@@ -1,537 +1,236 @@
-# Step 16: 生产化 & 交付
+# Step 16: 生产化与交付
 
 ## 目标
 
-把开发版变成可交付的产品：错误处理、备份恢复、打包分发、性能优化、安全加固。
+把前十五章的演示能力收束为可交付的软件：有明确部署边界、可迁移的数据、可观测的运行、可验证的构建和可回滚的发布。生产化不是“加一个日志文件”；它要求安全、质量、运维和用户恢复路径同时成立。
 
 ## 前置条件
 
-- 完成前 15 步的所有功能
+- 完成 [15-domain-features.md](15-domain-features.md)
+- 运行过后端、Vue 前端和端到端测试
+- 明确目标部署模式：单用户本地，或受控服务端
 
 ## 设计思路
 
-### 生产化检查清单
+### 先选择部署画像
+
+| 画像 | 适用场景 | 数据与安全边界 |
+|---|---|---|
+| 本地单用户 | 个人科研工作站 | SQLite + 本地 blob；浏览器仅监听 loopback；本地可信 kernel |
+| 受控团队服务 | 实验室/组织内部 | 身份认证、TLS、反向代理、持久卷、审计；不可信 kernel 使用隔离运行器 |
+| 公网多租户 | 不在本教程的交付范围 | 需要专门的身份、配额、隔离、密钥、合规与安全评审 |
+
+不要把“本地默认配置”暴露到公网后仍称为生产。尤其是 MCP、Python kernel、Artifact 下载和 LLM key，在受控团队服务中都必须重新评估权限模型。
+
+### 交付链路
 
 ```
-☐ 错误处理：所有异常都有友好的用户提示
-☐ 数据安全：备份/恢复/校验完整链路
-☐ 打包分发：pip install 一键安装
-☐ 日志系统：分级日志，可调试
-☐ 性能优化：大文件流式传输，数据库索引
-☐ 安全加固：输入验证，路径遍历防护
-☐ 版本管理：版本号 + 升级迁移
-☐ 文档：README + API 文档 + 开发者指南
+源码 + Skill + API schema
+  → ruff / typecheck / pytest / Vitest / Playwright
+  → 构建 Python wheel + Vue dist
+  → SBOM / 依赖与许可证检查
+  → 可复现发布产物
+  → 部署前 migrate + backup
+  → 健康检查、结构化日志、指标、告警
 ```
+
+每次发布都能回答：使用了哪个 Git revision、哪个前端构建、哪个数据库 schema、哪些 Skill hash；出现问题时也能回到上一个版本而不破坏用户数据。
 
 ## 实现
 
-### 1. 日志系统
+### 1. 集中类型化配置
 
 ```python
-# src/scientex_agent/logging_config.py
+# src/scientex_agent/settings.py
+from __future__ import annotations
 
-"""Centralized logging configuration."""
-
-import logging
-import sys
+from functools import lru_cache
 from pathlib import Path
+from typing import Literal
+
+from pydantic import AnyHttpUrl, Field, SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-def setup_logging(
-    level: int = logging.INFO,
-    log_file: str | Path | None = None,
-) -> logging.Logger:
-    """Configure logging for Scientex.
-
-    Args:
-        level: Log level (DEBUG, INFO, WARNING, ERROR).
-        log_file: Optional file to write logs to.
-
-    Returns:
-        Root logger.
-    """
-    logger = logging.getLogger("scientex_agent")
-    logger.setLevel(level)
-    logger.handlers.clear()
-
-    # Formatter
-    formatter = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="SCIENTEX_",
+        env_file=".env",
+        extra="ignore",
     )
 
-    # Console handler
-    console = logging.StreamHandler(sys.stderr)
-    console.setLevel(level)
-    console.setFormatter(formatter)
-    logger.addHandler(console)
+    environment: Literal["development", "local", "server"] = "local"
+    data_dir: Path = Path.home() / ".local" / "share" / "scientex"
+    log_level: str = "INFO"
+    api_host: str = "127.0.0.1"
+    api_port: int = Field(default=8765, ge=1, le=65535)
+    web_dist: Path | None = None
+    allowed_origins: tuple[AnyHttpUrl, ...] = ()
+    openai_api_key: SecretStr | None = None
+    database_url: str | None = None
 
-    # File handler
-    if log_file:
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setLevel(logging.DEBUG)  # File gets everything
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-
-    return logger
+    @property
+    def is_server(self) -> bool:
+        return self.environment == "server"
 
 
-# Usage
-logger = setup_logging(level=logging.INFO)
-logger.info("Scientex starting...")
-logger.debug("This won't show unless level=DEBUG")
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
 ```
 
-### 2. 错误处理
+将 `pydantic-settings>=2.0` 加入运行时依赖；`pydantic` 本身不包含这个配置包。
+
+`.env`、数据目录、SQLite、blob、日志和导出包必须写入 `.gitignore`。`SecretStr` 防止意外 `repr()` 输出，但不是密钥管理系统：服务器应从部署平台的 secret store 注入，轮换密钥时不用重建前端。
+
+### 2. 结构化日志、trace 与健康检查
 
 ```python
-# src/scientex_agent/errors.py
-
-"""Application-level error handling."""
-
-
-class ScientexError(Exception):
-    """Base exception for Scientex."""
-    def __init__(self, message: str, *, user_message: str | None = None):
-        super().__init__(message)
-        self.user_message = user_message or message
-
-
-class ConfigurationError(ScientexError):
-    """Configuration-related errors."""
-    pass
-
-
-class ProviderError(ScientexError):
-    """LLM provider errors (API key, network, rate limit)."""
-    pass
-
-
-class StorageError(ScientexError):
-    """Data storage errors."""
-    pass
-
-
-class ValidationError(ScientexError):
-    """Input validation errors."""
-    pass
-
-
-# Error handler middleware for FastAPI
-from fastapi import Request
-from fastapi.responses import JSONResponse
-
-async def scientex_error_handler(request: Request, exc: ScientexError):
-    return JSONResponse(
-        status_code=400,
-        content={"error": exc.user_message, "detail": str(exc)},
-    )
-
-async def unhandled_error_handler(request: Request, exc: Exception):
-    import logging
-    logger = logging.getLogger("scientex_agent")
-    logger.exception(f"Unhandled error: {exc}")
-    return JSONResponse(
-        status_code=500,
-        content={"error": "Internal server error", "detail": str(exc)},
-    )
+# 统一日志字段；实现可采用 structlog 或标准 logging 的 JSON formatter
+logger.info(
+    "tool.completed",
+    extra={
+        "trace_id": trace_id,
+        "run_id": run_id,
+        "frame_id": frame_id,
+        "tool": tool_name,
+        "duration_ms": elapsed_ms,
+        "outcome": "ok",
+    },
+)
 ```
 
-### 3. 输入验证与安全
+日志默认不记录 prompt 全文、MCP 参数、序列内容、Artifact 内容、cookie 或 API key。对异常文本先经过 redact，再记录到受权限保护的日志位置。HTTP middleware 创建或接收 `X-Request-Id`，并把同一个 trace id 传播到 RunEvent、provider 调用和工具执行。
 
-```python
-# src/scientex_agent/security.py
+健康检查分层：
 
-"""Security utilities — input validation, path safety, secret redaction."""
-
-import os
-import re
-from pathlib import Path
-
-
-# === Path Safety ===
-
-def safe_path(base_dir: Path, user_path: str | Path) -> Path:
-    """Resolve a user-supplied path, ensuring it stays within base_dir.
-
-    Raises:
-        ValueError: If the path escapes base_dir.
-    """
-    resolved = (base_dir / user_path).resolve()
-    if not str(resolved).startswith(str(base_dir.resolve())):
-        raise ValueError(f"Path escapes base directory: {user_path}")
-    return resolved
-
-
-# === Input Validation ===
-
-def validate_frame_id(frame_id: str) -> bool:
-    """Validate frame ID format (alphanumeric, 12 chars)."""
-    return bool(re.match(r"^[a-f0-9]{12}$", frame_id))
-
-
-def validate_project_name(name: str) -> str:
-    """Validate and sanitize a project name."""
-    name = name.strip()
-    if not name:
-        raise ValueError("Project name cannot be empty")
-    if len(name) > 200:
-        raise ValueError("Project name too long (max 200 chars)")
-    # Remove potentially dangerous characters
-    name = re.sub(r"[/\\:*?\"<>|]", "", name)
-    return name
-
-
-# === Secret Redaction ===
-
-_SECRET_PATTERNS = [
-    (re.compile(r"(sk-ant-[a-zA-Z0-9_-]+)"), "sk-ant-***"),
-    (re.compile(r"(sk-[a-zA-Z0-9_-]{20,})"), "sk-***"),
-    (re.compile(r"(AIza[a-zA-Z0-9_-]{30,})"), "AIza***"),
-    (re.compile(r"([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})"), "***@***"),
-]
-
-
-def redact_secrets(text: str) -> str:
-    """Redact API keys and credentials from text."""
-    for pattern, replacement in _SECRET_PATTERNS:
-        text = pattern.sub(replacement, text)
-    return text
-
-
-# === Rate Limiting ===
-
-import time
-from collections import defaultdict
-
-
-class RateLimiter:
-    """Simple in-memory rate limiter."""
-
-    def __init__(self, max_requests: int = 60, window: float = 60.0):
-        self.max_requests = max_requests
-        self.window = window
-        self._clients: dict[str, list[float]] = defaultdict(list)
-
-    def is_allowed(self, client_id: str) -> bool:
-        """Check if a client is within rate limits."""
-        now = time.time()
-        window_start = now - self.window
-
-        # Remove old entries
-        self._clients[client_id] = [
-            t for t in self._clients[client_id] if t > window_start
-        ]
-
-        if len(self._clients[client_id]) >= self.max_requests:
-            return False
-
-        self._clients[client_id].append(now)
-        return True
+```
+GET /api/v1/health/live   → 进程存活，不访问外部依赖
+GET /api/v1/health/ready  → 数据库可写、必要配置和关键依赖就绪
 ```
 
-### 4. 数据库迁移
+不要让 load balancer 的 liveness 检查因为临时 provider 网络故障而无限重启服务；provider 可用性应作为单独指标或 readiness 子项。
 
-```python
-# src/scientex_agent/migrations.py
+### 3. 错误、安全和权限基线
 
-"""Database schema migrations.
+- 所有 API 使用 Step 11 的 Problem Details；stack trace 只入日志。
+- 所有外部输入用 Pydantic 校验，所有逻辑路径经过 Artifact path 规范化。
+- MCP Server、Skill、Profile 和 kernel image 采用 allowlist；不从模型输出构造 shell 命令。
+- 服务端启用 TLS、身份认证、项目级授权与 CSRF/Origin 策略；本地 loopback 模式不把这些假设带到公网。
+- 写入、执行、网络和外部副作用工具由 `ToolPolicy` 记录审批决定；限流由反向代理或共享存储实现，不使用进程内字典伪装成集群限流。
+- 上传、导入 ZIP 和下载 Artifact 均有大小、类型、hash、路径与权限检查。
 
-When the schema version changes, apply migrations in order.
-"""
+安全评审必须把 Python kernel 单列：`trusted-local` 只允许可信本地用户；服务端的任何不可信代码只能进入隔离运行器，且默认无网络、最小文件挂载、非 root、资源上限和可销毁文件系统。
 
-SCHEMA_VERSION = 1
+### 4. 版本化迁移与备份恢复
 
-MIGRATIONS = {
-    1: """
-        -- Initial schema
-        CREATE TABLE IF NOT EXISTS schema_version (
-            version INTEGER PRIMARY KEY
-        );
-        INSERT OR IGNORE INTO schema_version (version) VALUES (1);
-    """,
-    # Future migrations:
-    # 2: """
-    #     ALTER TABLE projects ADD COLUMN tags TEXT DEFAULT '';
-    #     UPDATE schema_version SET version = 2;
-    # """,
-}
+建立单独 schema 版本表，迁移在应用启动前的显式命令中运行，而不是 HTTP 请求期间隐式 `CREATE TABLE`：
 
-
-def run_migrations(db_path: str) -> None:
-    """Apply any pending migrations to the database."""
-    import sqlite3
-
-    conn = sqlite3.connect(db_path)
-    try:
-        # Get current version
-        row = conn.execute(
-            "SELECT MAX(version) FROM schema_version"
-        ).fetchone()
-        current = row[0] if row and row[0] else 0
-
-        for version in range(current + 1, SCHEMA_VERSION + 1):
-            if version in MIGRATIONS:
-                conn.executescript(MIGRATIONS[version])
-                conn.commit()
-
-    finally:
-        conn.close()
+```bash
+uv run scientex_agent migrate status
+uv run scientex_agent migrate apply
+uv run scientex_agent backup create --output backups/scientex-2026-07-24.zip
+uv run scientex_agent backup verify backups/scientex-2026-07-24.zip
 ```
 
-### 5. 打包配置
+每个迁移必须有唯一递增编号、事务说明、数据回填策略和测试。SQLite 备份使用 SQLite backup API 或一致性快照；不能在 WAL 写入时直接复制一个 `.sqlite` 文件。备份包包含数据库、引用 blob、manifest、schema version 与 checksum；恢复先验证到临时位置，再经用户确认原子切换。发布前执行一次真实的“备份 → 新环境恢复 → smoke test”。
+
+### 5. 构建前后端发布物
 
 ```toml
-# pyproject.toml（完整版）
-
-[build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
-
+# pyproject.toml（节选）
 [project]
-name = "scientex_agent"
-version = "0.2.0"
-description = "Local scientific agent platform with pluggable LLM providers"
-requires-python = ">=3.11"
-readme = "README.md"
-license = { text = "MIT" }
-authors = [{ name = "Your Name", email = "you@example.com" }]
-keywords = ["scientific", "agent", "llm", "bioinformatics"]
-classifiers = [
-    "Development Status :: 4 - Beta",
-    "Intended Audience :: Science/Research",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-]
-
-dependencies = [
-    "openai>=2.46.0",
-    "mcp>=1.9",
-    "langgraph>=0.2.0",
-    "langchain-core>=0.3.0",
-    "langchain-openai>=0.2.0",
-    "fastapi>=0.110",
-    "uvicorn>=0.29",
-    "pandas>=2.2",
-    "pyyaml>=6.0",
-]
-
-[project.scripts]
-scientex_agent = "scientex_agent.cli:main"
-
-[project.optional-dependencies]
-dev = [
-    "pytest>=8",
-    "pytest-asyncio>=0.23",
-    "playwright>=1.46",
-    "ruff>=0.4",
-]
-
-[tool.setuptools.packages.find]
-where = ["src"]
-
-[tool.setuptools.package-data]
-scientex_agent = [
-    "web/*",
-    "web/**/*",
-    "skills/*/SKILL.md",
-    "skills/*/*.md",
-    "skills/*/*.py",
-]
-
-[tool.pytest.ini_options]
-pythonpath = ["src"]
-asyncio_mode = "auto"
+requires-python = ">=3.13"
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py313"
 
-[tool.ruff.lint]
-select = ["E", "F", "I", "N", "W"]
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
 ```
-
-### 6. 测试
-
-```python
-# tests/test_app.py
-
-"""Integration tests for the Scientex application."""
-
-import unittest
-import tempfile
-from pathlib import Path
-import asyncio
-
-from scientex_agent.app import ScientexApp
-
-
-class TestScientexApp(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.app = ScientexApp(Path(self.tmp.name))
-        self.app.initialize()
-
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def test_create_project(self):
-        project = self.app.create_project(name="Test")
-        self.assertEqual(project.name, "Test")
-        self.assertTrue(len(project.id) == 12)
-
-    def test_list_projects(self):
-        self.app.create_project(name="P1")
-        self.app.create_project(name="P2")
-        projects = self.app.list_projects()
-        self.assertEqual(len(projects), 2)
-
-    def test_create_frame(self):
-        project = self.app.create_project(name="Test")
-        frame = self.app.create_frame(project_id=project.id, name="Chat")
-        self.assertEqual(frame.name, "Chat")
-        self.assertEqual(frame.project_id, project.id)
-
-    def test_message_persistence(self):
-        project = self.app.create_project(name="Test")
-        frame = self.app.create_frame(project_id=project.id)
-        self.app.metadata.append_message(
-            frame_id=frame.id, role="user", content="Hello"
-        )
-        self.app.metadata.append_message(
-            frame_id=frame.id, role="assistant", content="Hi!"
-        )
-        messages = self.app.metadata.list_messages(frame.id)
-        self.assertEqual(len(messages), 2)
-        self.assertEqual(messages[0].role, "user")
-        self.assertEqual(messages[1].role, "assistant")
-
-
-class TestAsyncChat(unittest.IsolatedAsyncioTestCase):
-    """Tests that require async/await."""
-
-    async def test_chat_requires_api_key(self):
-        """Chat should raise an error if no API key is configured."""
-        # This test requires DEEPSEEK_API_KEY or OPENAI_API_KEY in env
-        import os
-        if not os.environ.get("DEEPSEEK_API_KEY") and not os.environ.get("OPENAI_API_KEY"):
-            self.skipTest("No API key configured")
-
-        import tempfile
-        app = ScientexApp(Path(tempfile.mkdtemp()))
-        app.initialize()
-        project = app.create_project(name="Test")
-        frame = app.create_frame(project_id=project.id)
-
-        result = await app.chat(frame_id=frame.id, content="Say hello in 3 words")
-        self.assertIn("content", result)
-        self.assertTrue(len(result["content"]) > 0)
-
-
-if __name__ == "__main__":
-    unittest.main()
-```
-
-### 7. README
-
-```markdown
-# Scientex
-
-Local scientific agent platform with pluggable LLM providers.
-
-## Quick Start
 
 ```bash
-# Install
-pip install scientex_agent
+# 后端
+uv sync --all-groups
+uv run ruff check .
+uv run ruff format --check .
+uv run pyright
+uv run pytest --cov=scientex_agent
 
-# Configure
-cat > .env.local << 'EOF'
-DEEPSEEK_API_KEY=sk-your-key
-DEEPSEEK_MODEL=deepseek-chat
-EOF
-
-# Initialize
-scientex_agent init
-
-# Chat
-scientex_agent chat
-
-# Start web server
-scientex_agent run-server
-# Open http://127.0.0.1:8765
+# 前端
+cd web
+pnpm install --frozen-lockfile
+pnpm lint
+pnpm build
+pnpm test:unit
+pnpm exec playwright test
 ```
 
-## Features
+发布脚本应先运行 `pnpm build`，再将 `web/dist` 复制或打包到 Python wheel 的 package data 中。开发服务器不属于发布物。构建应生成版本信息（Git revision、构建时间、前端 asset manifest）和 SBOM；依赖漏洞扫描/许可证策略在 CI 中作为门禁。
 
-- Multi-provider LLM support (OpenAI, Anthropic, DeepSeek, Gemini)
-- Tool calling with 200+ scientific tools
-- File-based skill system with 30+ built-in skills
-- Python code execution in isolated subprocess
-- MCP protocol for external tool servers
-- FastAPI HTTP server with SSE streaming
-- Project management with export/import
-- Backup, verify, and restore
-- Web UI with streaming chat
+### 6. CI 的最小门禁
 
-## Development
-
-```bash
-git clone https://github.com/.../scientex_agent
-cd scientex_agent
-uv sync
-uv run python -m unittest discover -s tests
+```yaml
+# .github/workflows/ci.yml（阶段示意）
+jobs:
+  backend:
+    steps: [checkout, setup-python, uv-sync, ruff, pyright, pytest]
+  frontend:
+    steps: [checkout, setup-node, pnpm-install-frozen, lint, build, vitest]
+  e2e:
+    needs: [backend, frontend]
+    steps: [start-api, start-preview, playwright]
+  package:
+    needs: [backend, frontend, e2e]
+    steps: [build-wheel, install-wheel-in-clean-env, smoke-test]
 ```
-```
+
+CI 还应保存 API OpenAPI schema 与前端截图/trace 作为失败诊断附件。不要只测试源码目录下的 Python：必须从构建出的 wheel 在干净环境启动一次，才能发现漏打包 Skill、静态资源或迁移文件。
+
+### 7. 发布检查清单
+
+- [ ] 所有测试、lint、typecheck、构建和依赖检查通过。
+- [ ] OpenAPI schema、Skill catalog、Profile 与数据库迁移均已审查。
+- [ ] 备份已验证，恢复演练通过，升级/回滚步骤已记录。
+- [ ] API key 与生产数据不在仓库、日志、截图或前端 bundle 中。
+- [ ] `live` 和 `ready` 健康检查、结构化日志和告警接收方可用。
+- [ ] 本次版本、Git revision、schema version、前端构建 hash 已写入 release note。
+- [ ] 服务端部署使用 TLS、认证、最小权限目录和受隔离的 kernel。
 
 ## 验证
 
 ```bash
-# 全部测试
-uv run python -m unittest discover -s tests -v
+# 从干净环境安装并运行打包结果
+uv build
+uv venv /tmp/scientex-smoke
+/tmp/scientex-smoke/bin/pip install dist/*.whl
+/tmp/scientex-smoke/bin/scientex_agent init --data-dir /tmp/scientex-data
 
-# 打包
-uv run python -m build
+# 数据恢复演练
+uv run scientex_agent backup create --output /tmp/scientex-backup.zip
+uv run scientex_agent backup verify /tmp/scientex-backup.zip
+uv run scientex_agent backup restore /tmp/scientex-backup.zip --data-dir /tmp/scientex-restore --yes
 
-# 安装
-pip install dist/scientex_agent-0.2.0-py3-none-any.whl
-
-# 验证安装
-scientex_agent --version
-scientex_agent init --data-dir /tmp/test-install
-scientex_agent chat --data-dir /tmp/test-install "Hello"
+# 前端生产预览
+cd web && pnpm build && pnpm vite preview
 ```
 
----
+验收不是只看页面能打开：创建 Project、发起流式 Run、拒绝高风险工具、生成 Artifact、导出、停止服务、恢复备份后都应可验证。对 server profile，还要验证未认证请求、跨项目访问、超大上传、恶意 ZIP、MCP 失联和 kernel 超时等失败路径。
 
-## 🎉 完成
+## 深入理解
 
-至此，你已经从零开始构建了一个完整的科学 agent 平台。
-回顾整个过程：
+### 可观测性与隐私的平衡
 
-```
-00  项目搭建              ← 现在可以 pip install
-01  首次 LLM 调用          ← 从零到第一条回复
-02  多轮对话               ← 上下文记忆
-03  流式输出               ← 实时显示
-04  工具调用               ← LLM 能做事了
-05  多提供商               ← 不再绑死一家
-06  对话持久化             ← 重启不丢失
-07  MCP 集成              ← 无限扩展工具
-08  技能系统               ← 领域知识注入
-09  Python 内核            ← 代码执行能力
-10  Agent 编排             ← LangGraph 专业编排
-11  HTTP API              ← FastAPI + SSE
-12  项目管理               ← 多项目/多帧/产物
-13  CLI                   ← 命令行完整体验
-14  Web 前端              ← SPA 界面
-15  领域功能               ← 生物/化学/记忆/验证
-16  生产化                 ← 可交付的产品
-```
+为了排障，需要 run id、时延、错误类型、工具名和版本；为了保护研究数据，不应把完整 prompt、序列和文件内容送入遥测。先定义事件字段和保留期，再选择日志/指标/trace 后端。可观测性系统本身也是数据处理者，需要访问控制与脱敏测试。
 
-继续改进的方向：
-- Agent 间协作（多 agent 对话）
-- 远程计算后端（SLURM, AWS Batch）
-- 插件市场（分享和安装技能）
-- 移动端适配
-- RAG（检索增强生成）集成
+### 单机 SQLite 的上线边界
+
+SQLite 在单用户或单进程服务中非常可靠，且便于备份；当需要多实例写入、跨机器高可用或复杂并发协作时，应迁移 metadata/checkpoint 到服务型数据库，blob 到对象存储。不要仅通过增大连接池来掩盖底层写入模型不匹配。
+
+## 完成
+
+至此，Scientex 已从一次 LLM 调用演进为具备 provider 抽象、持久化、MCP、Skill、受控执行、可恢复 Agent、FastAPI、**Vue 3 前端**、Artifact 证据链和发布门禁的科学 Agent 平台。
+
+后续迭代应继续遵循本教程的原则：先定义边界与可验证契约，再实现能力；任何自动化都不应绕过用户数据、工具权限和科学证据的审查。

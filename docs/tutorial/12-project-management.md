@@ -1,439 +1,270 @@
-# Step 12: 项目管理（多项目/多帧/产物）
+# Step 12: 项目管理（多项目 / Frame / 产物）
 
 ## 目标
 
-实现多项目管理：创建、切换、导出/导入项目，以及文件产物的版本管理。
+把 Step 06 的 Project 与 Frame 扩展成可复现的科研工作空间：Agent、MCP 和 Kernel 的输入/输出成为带版本、来源和 hash 的 Artifact；导出包可以在另一台机器上检查和重放。
 
 ## 前置条件
 
 - 完成 [11-http-api.md](11-http-api.md)
-- 理解 [06-conversation-persistence.md](06-conversation-persistence.md) 的数据模型
+- 理解 SQLite 事务与文件系统原子写入
 
 ## 设计思路
 
-### 数据层级
+### 工作空间模型
 
 ```
-Project (项目)
-  ├── name, description, context
-  ├── memory_enabled
+Project
+  ├── Frame（对话 / 任务分支）
+  │     └── Run（一次 Agent 执行，含事件和工具调用）
   │
-  ├── Frame (对话帧)
-  │     ├── name, status
-  │     ├── parent_frame_id (父子关系)
-  │     ├── Messages (消息历史)
-  │     └── Execution Records (代码执行记录)
+  ├── Artifact（稳定逻辑名称，例如 results/qc.csv）
+  │     └── ArtifactVersion（不可变版本，含 blob SHA-256）
   │
-  ├── Artifacts (文件产物)
-  │     ├── filename, content_type
-  │     └── ArtifactVersions (版本)
-  │
-  ├── Memories (持久记忆)
-  └── Notes (笔记)
+  └── ProvenanceEdge（run / tool / artifact / external source 之间的关系）
 ```
 
-### 项目生命周期
+Message 是对话记录；Artifact 是用户或工具产生、值得长期保留的文件/结构化数据；Run 是一次可观测的执行。三者分开，才能避免“聊天文本里有文件名”成为唯一证据。
+
+### 二进制内容与元数据分离
+
+- SQLite 保存 Artifact 元数据、版本、关联和事务状态；
+- blob 文件按内容 hash 存在受控根目录；
+- 用户看到的是稳定逻辑路径，实际文件名不直接接受用户输入；
+- 版本不可覆盖，最新版本只是一个查询结果。
 
 ```
-create → active → export/import/share → delete
+data/
+├── metadata.sqlite
+└── blobs/
+    └── sha256/
+        └── 5e/
+            └── 5e884898...    # 内容寻址；相同内容只保存一次
 ```
 
-每个项目的数据完全隔离：
-- SQLite 中通过 `project_id` 外键关联
-- 文件系统中通过 `artifacts/{project_id}/` 目录隔离
+这不是 Git 的替代品；它解决运行数据的可追溯性和去重。源代码、Skill 与配置仍应进入 Git 并在 Run 中记录 commit/hash。
 
-### 产物版本管理
+### 写入顺序
 
 ```
-artifacts/
-└── {project_id}/
-    └── {artifact_id}/
-        ├── v1_data.csv        ← 第一版
-        ├── v2_data.csv        ← 第二版
-        └── v3_data.csv        ← 当前版本
+用户/工具提交 bytes
+  → 在 blobs/.tmp 写入并计算 SHA-256
+  → fsync + 原子 rename 到 blobs/sha256/...
+  → SQLite BEGIN IMMEDIATE
+  → 插入 artifact_versions 与 provenance
+  → COMMIT
 ```
 
-每次保存同名文件自动创建新版本，保留完整历史。
+如果进程在 rename 后崩溃，会留下无引用 blob；启动时的垃圾回收可安全清理它。反过来，绝不能先在数据库声明版本再写文件，否则读者会看到不存在的 Artifact。
 
 ## 实现
 
-### 1. 扩展 models.py
+### 1. 扩展领域模型
 
 ```python
-# src/scientex_agent/models.py 新增
+# src/scientex_agent/models.py（新增）
+from dataclasses import dataclass
+from typing import Literal
+
 
 @dataclass(frozen=True)
 class Artifact:
-    """A file artifact stored in a project."""
     id: str
     project_id: str
-    root_frame_id: str           # which frame created this
-    frame_id: str | None         # which specific frame
-    filename: str
-    latest_version_id: str | None
-    folder_id: str | None        # for folder organization
-    is_user_upload: bool = False
-    is_ephemeral: bool = False   # temporary artifacts
-    created_at: int = 0
-    updated_at: int = 0
+    logical_path: str
+    media_type: str
+    created_at: int
 
 
 @dataclass(frozen=True)
 class ArtifactVersion:
-    """A specific version of an artifact file."""
     id: str
     artifact_id: str
-    version_number: int          # 1, 2, 3, ...
-    frame_id: str | None         # which frame produced this version
-    producing_execution_id: str | None
-    content_type: str            # MIME type
+    version: int
+    blob_sha256: str
     size_bytes: int
-    checksum: str                # SHA-256
-    storage_path: str            # relative path under artifacts/
-    language: str | None = None  # programming language if code
-    extracted_code: str | None = None
-    created_at: int = 0
+    created_by_run_id: str | None
+    metadata_json: str
+    created_at: int
 
 
 @dataclass(frozen=True)
-class Memory:
-    """A durable memory entry for a project."""
-    id: str
+class ProvenanceEdge:
     project_id: str
-    category: str                # "user", "project", "knowledge"
-    content: str
-    created_at: int = 0
-    updated_at: int = 0
-
-
-@dataclass(frozen=True)
-class Note:
-    """A freeform note attached to a project."""
-    id: str
-    project_id: str | None
-    title: str
-    content: str
-    created_at: int = 0
-    updated_at: int = 0
+    source_kind: Literal["run", "tool_execution", "artifact", "external"]
+    source_id: str
+    target_artifact_version_id: str
+    relation: Literal["generated", "used", "derived_from", "cites"]
 ```
 
-### 2. 创建 src/scientex_agent/artifact_store.py
+`logical_path` 不是操作系统路径。接受它时先规范化为 POSIX 相对路径，禁止空段、`..`、绝对路径和控制字符；文件系统内部只根据 hash 寻址。
+
+### 2. 创建内容寻址 BlobStore
 
 ```python
-"""File-based artifact storage with versioning."""
-
+# src/scientex_agent/blob_store.py
 from __future__ import annotations
 
 import hashlib
-import shutil
+import os
+import tempfile
 from pathlib import Path
 
-from .metadata import MetadataStore
-from .models import Artifact, ArtifactVersion
 
+class BlobStore:
+    def __init__(self, root: Path) -> None:
+        self._root = root.resolve()
+        self._tmp = self._root / ".tmp"
+        self._tmp.mkdir(parents=True, exist_ok=True)
 
-class ArtifactStore:
-    """Manages versioned file artifacts for projects.
+    def put_bytes(self, content: bytes) -> tuple[str, int]:
+        digest = hashlib.sha256(content).hexdigest()
+        destination = self._root / "sha256" / digest[:2] / digest
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists():
+            return digest, len(content)
 
-    Directory structure::
+        fd, temporary_name = tempfile.mkstemp(dir=self._tmp, prefix="blob-")
+        try:
+            with os.fdopen(fd, "wb") as temporary:
+                temporary.write(content)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            try:
+                os.replace(temporary_name, destination)
+            except FileExistsError:
+                pass  # 并发写入同一 hash：另一方已经完成
+        finally:
+            Path(temporary_name).unlink(missing_ok=True)
+        return digest, len(content)
 
-        {data_dir}/artifacts/
-        └── {project_id}/
-            ├── {artifact_id}/
-            │   ├── v0001_data.csv
-            │   ├── v0002_data.csv
-            │   └── latest → v0002_data.csv
-            └── ...
-
-    Usage::
-
-        store = ArtifactStore(data_dir, metadata_store)
-        version = store.save(
-            project_id="abc",
-            filename="results.csv",
-            data=b"col1,col2\\n1,2\\n",
-            content_type="text/csv",
-            frame_id="frame-1",
-        )
-        content = store.read(version)
-    """
-
-    def __init__(self, data_dir: str | Path, metadata: MetadataStore) -> None:
-        self._root = Path(data_dir) / "artifacts"
-        self.metadata = metadata
-
-    def _project_dir(self, project_id: str) -> Path:
-        return self._root / project_id
-
-    def _artifact_dir(self, artifact_id: str) -> Path:
-        # artifact_id includes project_id, but we use it as a unique key
-        return self._root / artifact_id[:12] / artifact_id
-
-    def save(
-        self,
-        *,
-        project_id: str,
-        filename: str,
-        data: bytes,
-        content_type: str = "application/octet-stream",
-        frame_id: str | None = None,
-        is_user_upload: bool = False,
-    ) -> ArtifactVersion:
-        """Save a new version of a file.
-
-        If an artifact with the same filename already exists in the project,
-        a new version is created. Otherwise, a new artifact is created.
-        """
-        from .metadata import _new_id, _now_ms
-
-        # Find existing artifact by filename in this project
-        existing = self.metadata.get_artifact_by_filename(project_id, filename)
-
-        if existing:
-            artifact_id = existing.id
-            version_number = self.metadata.next_artifact_version(artifact_id)
-        else:
-            artifact_id = _new_id()
-            version_number = 1
-            self.metadata.create_artifact(
-                id=artifact_id,
-                project_id=project_id,
-                filename=filename,
-                frame_id=frame_id,
-                is_user_upload=is_user_upload,
-            )
-
-        # Compute checksum
-        checksum = hashlib.sha256(data).hexdigest()
-
-        # Write file
-        version_dir = self._artifact_dir(artifact_id)
-        version_dir.mkdir(parents=True, exist_ok=True)
-        version_filename = f"v{version_number:04d}_{filename}"
-        version_path = version_dir / version_filename
-        version_path.write_bytes(data)
-
-        # Update latest symlink
-        latest_link = version_dir / f"latest_{filename}"
-        if latest_link.exists() or latest_link.is_symlink():
-            latest_link.unlink()
-        latest_link.symlink_to(version_filename)
-
-        # Record in metadata
-        version = self.metadata.create_artifact_version(
-            artifact_id=artifact_id,
-            version_number=version_number,
-            content_type=content_type,
-            size_bytes=len(data),
-            checksum=checksum,
-            storage_path=str(version_path.relative_to(self._root)),
-            frame_id=frame_id,
-        )
-
-        return version
-
-    def read(self, version: ArtifactVersion) -> bytes:
-        """Read the content of an artifact version."""
-        path = self._root / version.storage_path
-        if not path.exists():
-            raise FileNotFoundError(f"Artifact version file not found: {path}")
-        return path.read_bytes()
-
-    def latest_version(self, artifact_id: str) -> ArtifactVersion | None:
-        """Get the latest version of an artifact."""
-        return self.metadata.get_latest_artifact_version(artifact_id)
-
-    def read_latest(self, project_id: str, filename: str) -> bytes | None:
-        """Read the latest version of an artifact by project + filename."""
-        artifact = self.metadata.get_artifact_by_filename(project_id, filename)
-        if not artifact or not artifact.latest_version_id:
-            return None
-        version = self.metadata.get_artifact_version(artifact.latest_version_id)
-        if not version:
-            return None
-        return self.read(version)
-
-    def delete_artifact(self, artifact_id: str) -> None:
-        """Delete an artifact and all its versions."""
-        artifact_dir = self._artifact_dir(artifact_id)
-        if artifact_dir.exists():
-            shutil.rmtree(artifact_dir)
-        self.metadata.delete_artifact(artifact_id)
-
-    def export_project(self, project_id: str, target_path: str | Path) -> Path:
-        """Export a project's artifacts as a zip file."""
-        import zipfile
-
-        target = Path(target_path)
-        project_dir = self._project_dir(project_id)
-
-        with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zf:
-            if project_dir.exists():
-                for file_path in project_dir.rglob("*"):
-                    if file_path.is_file():
-                        arcname = str(file_path.relative_to(self._root))
-                        zf.write(file_path, arcname)
-
-            # Also export metadata as JSON
-            import json
-            project = self.metadata.get_project(project_id)
-            if project:
-                zf.writestr(
-                    "project.json",
-                    json.dumps({
-                        "id": project.id,
-                        "name": project.name,
-                        "description": project.description,
-                        "context": project.context,
-                    }, ensure_ascii=False, indent=2),
-                )
-
-        return target
-
-    def import_project(self, package_path: str | Path, project_name: str | None = None):
-        """Import a project from a zip file."""
-        import zipfile
-        import json
-
-        package = Path(package_path)
-        project_id = None
-
-        with zipfile.ZipFile(package, "r") as zf:
-            # Read project metadata
-            if "project.json" in zf.namelist():
-                meta = json.loads(zf.read("project.json"))
-                project_name = project_name or meta.get("name", "Imported Project")
-                project_id = meta.get("id")
-
-            # Create project
-            project = self.metadata.create_project(
-                name=project_name or "Imported Project",
-                description=f"Imported from {package.name}",
-            )
-
-            # Extract files
-            for member in zf.namelist():
-                if member == "project.json":
-                    continue
-                # Extract to artifacts directory
-                target = self._root / member
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(zf.read(member))
-
-        return project
+    def open(self, digest: str):
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise ValueError("invalid sha256 digest")
+        return (self._root / "sha256" / digest[:2] / digest).open("rb")
 ```
 
-### 3. 扩展 API 路由
+生产实现对输入使用流式 hash，避免大文件全部驻留内存；示例保持短小以展示原子顺序。blob 根目录由应用配置决定，任何用户提供的路径都不能绕过它。
+
+### 3. 在事务中创建不可变版本
 
 ```python
-# api_server.py 新增路由
+# src/scientex_agent/artifact_service.py（核心方法）
+def create_version(
+    self,
+    *,
+    project_id: str,
+    logical_path: str,
+    content: bytes,
+    media_type: str,
+    run_id: str | None,
+    metadata: dict,
+) -> ArtifactVersion:
+    normalized = normalize_logical_path(logical_path)
+    digest, size = self._blobs.put_bytes(content)
 
-# === Artifacts ===
-
-@api.get("/projects/{project_id}/artifacts")
-async def list_artifacts(project_id: str) -> list[dict]:
-    artifacts = scientex.metadata.list_artifacts(project_id)
-    return [{"id": a.id, "filename": a.filename, "latest_version_id": a.latest_version_id,
-             "is_user_upload": a.is_user_upload, "created_at": a.created_at} for a in artifacts]
-
-@api.get("/artifacts/{artifact_id}/versions")
-async def list_versions(artifact_id: str) -> list[dict]:
-    versions = scientex.metadata.list_artifact_versions(artifact_id)
-    return [{"id": v.id, "version_number": v.version_number, "content_type": v.content_type,
-             "size_bytes": v.size_bytes, "checksum": v.checksum} for v in versions]
-
-@api.get("/artifact-versions/{version_id}")
-async def get_artifact_version(version_id: str):
-    version = scientex.metadata.get_artifact_version(version_id)
-    if not version:
-        raise HTTPException(status_code=404)
-    data = scientex.artifacts.read(version)
-    from fastapi.responses import Response
-    return Response(content=data, media_type=version.content_type)
-
-@api.post("/projects/{project_id}/artifacts/upload")
-async def upload_artifact(project_id: str, file: UploadFile):
-    data = await file.read()
-    version = scientex.artifacts.save(
-        project_id=project_id, filename=file.filename or "upload",
-        data=data, content_type=file.content_type or "application/octet-stream",
-        is_user_upload=True,
-    )
-    return {"id": version.id, "version_number": version.version_number, "checksum": version.checksum}
-
-# === Export/Import ===
-
-@api.post("/projects/{project_id}/export")
-async def export_project(project_id: str) -> dict:
-    import tempfile
-    output = Path(tempfile.gettempdir()) / f"{project_id}_export.zip"
-    path = scientex.artifacts.export_project(project_id, output)
-    return {"path": str(path)}
-
-@api.post("/projects/import")
-async def import_project(file: UploadFile, name: str | None = None) -> dict:
-    import tempfile
-    tmp = Path(tempfile.gettempdir()) / f"import_{file.filename}"
-    tmp.write_bytes(await file.read())
-    try:
-        project = scientex.artifacts.import_project(tmp, name)
-        return {"id": project.id, "name": project.name}
-    finally:
-        tmp.unlink(missing_ok=True)
-
-# === Memories ===
-
-@api.get("/projects/{project_id}/memories")
-async def list_memories(project_id: str) -> list[dict]:
-    memories = scientex.metadata.list_memories(project_id)
-    return [{"id": m.id, "category": m.category, "content": m.content} for m in memories]
-
-@api.post("/projects/{project_id}/memories")
-async def create_memory(project_id: str, req: CreateMemoryRequest) -> dict:
-    memory = scientex.metadata.create_memory(project_id=project_id, category=req.category, content=req.content)
-    return {"id": memory.id}
+    with self._metadata.transaction(immediate=True) as conn:
+        artifact = self._metadata.get_or_create_artifact(
+            conn, project_id=project_id, logical_path=normalized, media_type=media_type
+        )
+        next_version = self._metadata.next_artifact_version(conn, artifact.id)
+        version = self._metadata.insert_artifact_version(
+            conn,
+            artifact_id=artifact.id,
+            version=next_version,
+            blob_sha256=digest,
+            size_bytes=size,
+            created_by_run_id=run_id,
+            metadata=metadata,
+        )
+        if run_id:
+            self._metadata.insert_provenance(
+                conn, project_id=project_id, source_kind="run", source_id=run_id,
+                target_artifact_version_id=version.id, relation="generated",
+            )
+    return version
 ```
+
+同一 Artifact 的 `version` 设置唯一约束 `(artifact_id, version)`。并发冲突返回 409 或在有限次数内重新读取版本号后重试；绝不能使用“读最大值、连接关闭、再写入”的无事务流程。
+
+### 4. 设计 API 和导出包
+
+Step 11 的 API 增加以下端点：
+
+```
+GET  /api/v1/projects/{project_id}/artifacts
+GET  /api/v1/projects/{project_id}/artifacts/{artifact_id}/versions
+GET  /api/v1/artifact-versions/{version_id}/content
+POST /api/v1/projects/{project_id}/exports
+POST /api/v1/projects/imports
+```
+
+导出格式使用 ZIP + `manifest.json`，而不是 pickle：
+
+```json
+{
+  "format": "scientex-project-export",
+  "format_version": 1,
+  "project": {"id": "proj_01", "name": "CRISPR screen"},
+  "artifacts": [
+    {
+      "logical_path": "results/qc.csv",
+      "version": 2,
+      "sha256": "5e8848...",
+      "archive_path": "blobs/5e8848..."
+    }
+  ],
+  "skills": [{"id": "literature-review@1.0.0", "sha256": "..."}],
+  "source_revision": "git:abc123"
+}
+```
+
+导入时先验证 schema、archive 成员路径、每个 blob hash 和大小限制；通过后写入临时目录，最后在事务中登记。不要解压到用户指定路径，也不要相信 ZIP 内的文件名。
+
+### 5. 把 Run、Artifact 与引用连起来
+
+`artifact__write`、kernel 输出和 MCP 下载都必须带 `run_id` 与输入 Artifact version id。UI 显示结果时可提供：
+
+```
+这个 CSV
+  ← Run run_123（模型 / provider / skill hash）
+  ← Tool pubmed__search（参数和时间）
+  ← 输入 data/raw/papers.json@3（SHA-256）
+```
+
+这条 provenance DAG 在科学场景中比“最终回答写得通顺”更重要：它使用户可以检查来源、复用某一步或发现错误后只重新计算受影响的下游版本。
 
 ## 验证
 
-```python
-from pathlib import Path
-from scientex_agent.metadata import MetadataStore
-from scientex_agent.artifact_store import ArtifactStore
+```bash
+# 第一次创建与第二次更新同一逻辑文件，版本递增
+uv run scientex_agent artifacts put --project PROJECT_ID results/qc.csv ./qc-v1.csv
+uv run scientex_agent artifacts put --project PROJECT_ID results/qc.csv ./qc-v2.csv
+uv run scientex_agent artifacts history --project PROJECT_ID results/qc.csv
 
-data_dir = Path("/tmp/scientex_agent-test")
-meta = MetadataStore(data_dir / "app.db")
-meta.initialize()
-store = ArtifactStore(data_dir, meta)
-
-# 创建项目
-project = meta.create_project(name="Test")
-
-# 保存文件（第一版）
-v1 = store.save(project_id=project.id, filename="data.csv",
-                data=b"name,value\na,1\n", content_type="text/csv")
-print(f"v1: version {v1.version_number}, checksum={v1.checksum[:8]}")
-
-# 保存文件（第二版）
-v2 = store.save(project_id=project.id, filename="data.csv",
-                data=b"name,value\na,1\nb,2\n", content_type="text/csv")
-print(f"v2: version {v2.version_number}, checksum={v2.checksum[:8]}")
-
-# 读取最新版本
-data = store.read_latest(project.id, "data.csv")
-print(f"Latest content: {data.decode()}")
-
-# 导出
-zip_path = store.export_project(project.id, Path("/tmp/export_test.zip"))
-print(f"Exported to: {zip_path}")
+# 导出后在临时目录验证清单和 hash，不导入
+uv run scientex_agent projects export PROJECT_ID --output project.scitex.zip
+uv run scientex_agent projects verify-export project.scitex.zip
 ```
+
+至少测试：相同 bytes 去重、逻辑路径穿越被拒绝、版本号在并发写入中不重复、写入失败不会出现数据库悬挂版本、篡改 ZIP 内 blob 后导入失败、Run 生成的 Artifact 有完整 provenance edge。
+
+## 深入理解
+
+### 为什么不直接把文件放在 SQLite BLOB
+
+小型项目可以这样做，但把大量二进制文件放进 SQLite 会放大数据库、备份和写锁。内容寻址文件存储结合 SQLite 元数据，能获得更好的大文件流式读写与去重，同时保留事务性的版本记录。部署成多机服务时，再将 `BlobStore` 替换为对象存储适配器。
+
+### 删除与保留策略
+
+用户删除逻辑 Artifact 时，先标记删除或移除引用，不立即删除 blob。只在所有版本、导出和保留期都不再引用后，由带 dry-run 报告的垃圾回收清理。科研记录通常需要比界面可见内容更长的保留期。
 
 ## 当前局限
 
-1. 没有文件夹组织（所有产物扁平存放）
-2. 没有产物预览生成
-3. 大文件上传没有进度反馈
+- 目前以本地 SQLite + 文件系统为目标，不提供多人并发编辑或云对象存储。
+- provenance 记录关系与 hash，不自动判断科学结论是否正确。
+- 导出包不包含 provider API key、kernel 状态或任意本机绝对路径。
 
 ## 下一步
 
-→ [13-cli.md](13-cli.md)
+下一章将这些能力包装为稳定的 Typer CLI：交互式聊天方便探索，脚本化命令和 JSON 输出方便自动化与 CI。

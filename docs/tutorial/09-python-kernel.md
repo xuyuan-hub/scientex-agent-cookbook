@@ -2,445 +2,269 @@
 
 ## 目标
 
-让 agent 能执行 Python 代码——在沙箱中运行数据分析、生成图表、处理数据。
+提供可复用、可取消、可审计的 Python 计算运行时，用于数据整理和科学分析。它支持会话级变量状态，但不会把“子进程”误称为安全沙箱：处理不可信代码时，仍需由容器、虚拟机或受限账户提供真正的隔离。
 
 ## 前置条件
 
 - 完成 [08-skill-system.md](08-skill-system.md)
-- 理解工具调用 [04-tool-calling.md](04-tool-calling.md)
+- 了解 [07-mcp-integration.md](07-mcp-integration.md) 的异步资源管理
+
+## 与 Step 08 的边界
+
+Skill 可以说明分析的步骤，Python Kernel 负责执行明确的代码片段。Kernel 不读取任意宿主机文件、不继承全部环境变量，也不让代码随意调用应用内部对象；与项目交互只能经过窄且可审计的 capability API。
 
 ## 设计思路
 
-### 两种内核模式
+### 两种运行配置
 
-| | In-Process | Subprocess |
+| 配置 | 用途 | 隔离与限制 |
 |---|---|---|
-| 安全性 | ❌ 低（可访问宿主内存） | ✅ 高（独立进程） |
-| 性能 | ✅ 快（无进程启动开销） | ❌ 慢（需启动子进程） |
-| 状态保持 | ✅ 跨执行共享 namespace | ✅ 通过 JSON 协议维持 |
-| 适用场景 | 开发/调试 | 生产环境 |
+| `trusted-local` | 开发者或本机可信分析 | 独立子进程、最小环境、超时、输出上限 |
+| `isolated` | 用户提供或远程执行的代码 | 容器/微虚拟机、只读镜像、非 root、网络默认关闭、CPU/内存/磁盘配额 |
 
-**默认使用 Subprocess 内核**（安全性优先）。
+Step 09 实现运行时协议和 `trusted-local`；`isolated` 是部署层的适配接口。仅靠删除 `open()` 或黑名单 import 不能安全执行 Python，不能把它作为安全方案。
 
-### Subprocess 通信协议
+### JSON Lines 协议
+
+长驻进程减少导入开销，也让变量可以在同一 Frame 内延续。host 和 worker 只用一行一个 JSON 的双向协议通信：
 
 ```
-父进程 (agent)                      子进程 (kernel worker)
-    │                                      │
-    │── {"source": "x=1+1\\nprint(x)"} ──→│
-    │                                      │ exec(...)
-    │←── {"stdout": "2\\n", "stderr": ""}─│
-    │                                      │
-    │── {"source": "print(x*2)"} ────────→│
-    │                                      │ exec(...)
-    │←── {"stdout": "4\\n", "stderr": ""}─│
+host → {"id":"run_01","type":"execute","code":"x = 2\nx * 21","timeout_ms":10000}
+worker → {"id":"run_01","type":"stdout","text":"42\n"}
+worker → {"id":"run_01","type":"result","value_repr":"42","mime":"text/plain"}
+worker → {"id":"run_01","type":"complete","ok":true}
+
+host → {"id":"run_02","type":"cancel"}
+worker → {"id":"run_02","type":"complete","ok":false,"error":{"code":"cancelled"}}
 ```
 
-每行是一个 JSON 对象，用 `\n` 分隔。
+协议必须有 `id`，才能把并发请求、取消和日志正确关联。事件是结构化数据，不要混在 stdout 中用特殊字符串解析。
 
-### host 回调
+### 能力而非对象注入
 
-内核中的代码可以通过 `host` 模块回调 agent 的能力：
+旧式设计常把一个可调用的 `host` Python 对象塞给用户代码。这会扩大可见 API，并难以追踪权限。本教程改为内核事件：
 
-```python
-# 在内核中执行
-host.llm("Summarize the results")          # 调用 LLM
-host.read_file("data.csv")                 # 读取工作区文件
-host.artifact_path("abc123")               # 获取产物路径
+```
+代码 → emit_capability_request("artifact.read", {"artifact_id": "..."})
+     → host 校验项目、用户和工具策略
+     → host 返回具有限制的 JSON 结果
 ```
 
-这通过子进程向父进程发送 `{"type": "host_call", ...}` 消息实现。
+第一版只开放只读、明确声明的能力；写入产物、网络访问和执行外部程序由 Step 10 的审批策略控制。
 
 ## 实现
 
-### 1. 创建 src/scientex_agent/kernel.py
+### 1. 定义运行时消息模型
 
 ```python
-"""Python execution kernel — in-process and subprocess variants."""
-
+# src/scientex_agent/kernel_models.py
 from __future__ import annotations
 
-import ast
-import json
-import subprocess
+from typing import Annotated, Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class ExecuteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str
+    type: Literal["execute"] = "execute"
+    code: Annotated[str, Field(min_length=1, max_length=100_000)]
+    timeout_ms: Annotated[int, Field(ge=100, le=120_000)] = 10_000
+
+
+class KernelEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    type: Literal["stdout", "stderr", "result", "error", "complete", "capability_request"]
+    text: str | None = None
+    value_repr: str | None = None
+    mime: str | None = None
+    payload: dict[str, Any] | None = None
+    ok: bool | None = None
+```
+
+Pydantic 在 host 和 worker 两端校验消息。输出、code 和 timeout 都有上限，防止单个请求意外耗尽内存或把 Web SSE 塞满。
+
+### 2. 创建异步 host
+
+```python
+# src/scientex_agent/kernel.py
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import os
 import sys
-import threading
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Callable
+from collections.abc import AsyncIterator
 
-
-@dataclass(frozen=True)
-class KernelResult:
-    stdout: str = ""
-    stderr: str = ""
-    exit_status: str = "ok"   # "ok" | "error" | "timeout"
-    error: str | None = None
+from .kernel_models import ExecuteRequest, KernelEvent
 
 
 class PythonKernel:
-    """In-process Python kernel. Executes code in a persistent namespace.
+    """Long-lived worker bound to one Frame; not a security sandbox."""
 
-    NOT safe for untrusted code. Use SubprocessPythonKernel for production.
-    """
+    def __init__(self, *, worker_module: str = "scientex_agent.kernel_worker") -> None:
+        self._worker_module = worker_module
+        self._process: asyncio.subprocess.Process | None = None
+        self._lock = asyncio.Lock()
 
-    def __init__(self, workspace: str | Path) -> None:
-        self.workspace = Path(workspace)
-        self.namespace: dict[str, Any] = {
-            "__builtins__": __builtins__,
-            "workspace": str(self.workspace),
+    async def start(self) -> None:
+        if self._process and self._process.returncode is None:
+            return
+        env = {
+            "PATH": os.environ.get("PATH", ""),
+            "PYTHONUNBUFFERED": "1",
+            "PYTHONNOUSERSITE": "1",
         }
-
-    def execute(self, source: str) -> KernelResult:
-        stdout_parts = []
-        stderr_parts = []
-
-        def _write(text: str):
-            stdout_parts.append(text)
-
-        try:
-            code = compile(source, "<kernel>", "exec")
-            old_stdout_write = getattr(sys.stdout, "write", None)
-            # Simple capture: redirect sys.stdout
-            import io
-            buf = io.StringIO()
-            old_stdout = sys.stdout
-            old_stderr = sys.stderr
-            sys.stdout = buf
-            sys.stderr = buf
-            try:
-                exec(code, self.namespace)
-            finally:
-                sys.stdout = old_stdout
-                sys.stderr = old_stderr
-            return KernelResult(stdout=buf.getvalue())
-        except Exception as e:
-            return KernelResult(stderr=str(e), exit_status="error", error=str(e))
-
-    def close(self) -> None:
-        self.namespace.clear()
-
-
-class SubprocessPythonKernel:
-    """Subprocess-based Python kernel with JSON-line protocol.
-
-    Safe for production. The kernel runs in an isolated child process.
-    """
-
-    def __init__(self, workspace: str | Path, *, timeout: float = 60.0) -> None:
-        self.workspace = Path(workspace)
-        self.workspace.mkdir(parents=True, exist_ok=True)
-        self.timeout = timeout
-        self.host_call_handler: Callable | None = None
-        self._proc: subprocess.Popen | None = None
-        self._lock = threading.Lock()
-
-    def start(self) -> None:
-        """Launch the kernel worker subprocess."""
-        self._proc = subprocess.Popen(
-            [sys.executable, "-c", _KERNEL_WORKER_SCRIPT],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            cwd=str(self.workspace),
+        self._process = await asyncio.create_subprocess_exec(
+            sys.executable, "-I", "-m", self._worker_module,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+            start_new_session=True,
         )
 
-    def execute(self, source: str) -> KernelResult:
-        """Send code to the kernel and wait for the result."""
-        if self._proc is None:
-            self.start()
-
-        with self._lock:
-            assert self._proc and self._proc.stdin
-            payload = json.dumps({"source": source, "filename": "<kernel>"})
-            self._proc.stdin.write(payload + "\n")
-            self._proc.stdin.flush()
-
-            # Read response line
-            line = self._proc.stdout.readline()
-            if not line:
-                return KernelResult(exit_status="error", error="Kernel process died")
-
-            try:
-                result = json.loads(line)
-            except json.JSONDecodeError:
-                return KernelResult(exit_status="error", error=f"Bad kernel response: {line[:200]}")
-
-            # Handle host calls (nested RPC)
-            while result.get("type") == "host_call":
-                handler_result = self._handle_host_call(result)
-                self._proc.stdin.write(json.dumps(handler_result) + "\n")
-                self._proc.stdin.flush()
-                line = self._proc.stdout.readline()
-                result = json.loads(line)
-
-            return KernelResult(
-                stdout=result.get("stdout", ""),
-                stderr=result.get("stderr", ""),
-                exit_status=result.get("exit_status", "ok"),
-                error=result.get("error"),
+    async def execute(self, request: ExecuteRequest) -> AsyncIterator[KernelEvent]:
+        await self.start()
+        assert self._process and self._process.stdin and self._process.stdout
+        async with self._lock:  # 一个解释器一次只跑一个 cell
+            self._process.stdin.write(
+                (request.model_dump_json() + "\n").encode("utf-8")
             )
-
-    def _handle_host_call(self, request: dict) -> dict:
-        """Handle a host.* call from the kernel worker."""
-        if self.host_call_handler is None:
-            return {"type": "host_response", "ok": False, "error": "No host handler configured"}
-
-        method = request.get("method", "")
-        args = request.get("args", [])
-        kwargs = request.get("kwargs", {})
-
-        try:
-            result = self.host_call_handler(method, args, kwargs)
-            return {"type": "host_response", "ok": True, "result": result}
-        except Exception as e:
-            return {"type": "host_response", "ok": False, "error": str(e)}
-
-    def stop(self) -> None:
-        if self._proc:
+            await self._process.stdin.drain()
             try:
-                self._proc.stdin.close()
-                self._proc.terminate()
-                self._proc.wait(timeout=5)
-            except Exception:
-                self._proc.kill()
-            self._proc = None
-
-    def close(self) -> None:
-        self.stop()
-
-
-# === Kernel Worker Script ===
-
-_KERNEL_WORKER_SCRIPT = r'''
-import json
-import sys
-from pathlib import Path
-
-namespace: dict = {"__builtins__": __builtins__}
-
-# Host proxy — intercepts host.* calls
-class _HostProxy:
-    def __getattr__(self, method):
-        def _call(*args, **kwargs):
-            req = json.dumps({
-                "type": "host_call",
-                "method": method,
-                "args": list(args),
-                "kwargs": kwargs,
-            })
-            sys.stdout.write(req + "\n")
-            sys.stdout.flush()
-            resp_line = sys.stdin.readline()
-            resp = json.loads(resp_line)
-            if resp.get("ok"):
-                return resp.get("result")
-            raise RuntimeError(resp.get("error", "host call failed"))
-        return _call
-
-host = _HostProxy()
-namespace["host"] = host
-
-# Main loop: read JSON-line commands, execute, write results
-for raw_line in sys.stdin:
-    line = raw_line.strip()
-    if not line:
-        continue
-    try:
-        request = json.loads(line)
-    except json.JSONDecodeError:
-        continue
-
-    source = request.get("source", "")
-    filename = request.get("filename", "<kernel>")
-
-    try:
-        import io
-        buf = io.StringIO()
-        old_stdout = sys.stdout
-        old_stderr = sys.stderr
-        sys.stdout = buf
-        sys.stderr = buf
-        try:
-            exec(compile(source, filename, "exec"), namespace)
-            response = {"stdout": buf.getvalue(), "stderr": "", "exit_status": "ok"}
-        except Exception as e:
-            response = {"stdout": buf.getvalue(), "stderr": str(e), "exit_status": "error", "error": str(e)}
-        finally:
-            sys.stdout = old_stdout
-            sys.stderr = old_stderr
-    except Exception as e:
-        response = {"stdout": "", "stderr": str(e), "exit_status": "error", "error": str(e)}
-
-    sys.__stdout__.write(json.dumps(response) + "\n")
-    sys.__stdout__.flush()
-'''
-
-
-# === Sidecar Loader (inject skill helper code) ===
-
-@dataclass(frozen=True)
-class SidecarLoadResult:
-    names: list[str] = field(default_factory=list)
-    error: str | None = None
-
-
-def validate_python_sidecar(source: str) -> SidecarLoadResult:
-    """Validate that a Python sidecar only contains safe constructs.
-
-    Allowed at module scope: function defs, imports, literal assignments.
-    Forbidden: decorators, wildcard imports, non-literal defaults, class defs.
-    """
-    try:
-        tree = ast.parse(source)
-        defined_names = []
-        for node in ast.iter_child_nodes(tree):
-            if isinstance(node, ast.FunctionDef):
-                if node.decorator_list:
-                    return SidecarLoadResult(error=f"Function '{node.name}' has decorators (not allowed)")
-                # Check default values are literals
-                for default in node.args.defaults:
-                    if not isinstance(default, ast.Constant):
-                        return SidecarLoadResult(
-                            error=f"Function '{node.name}' has non-literal default (not allowed)"
-                        )
-                defined_names.append(node.name)
-            elif isinstance(node, ast.Import):
-                for alias in node.names:
-                    defined_names.append(alias.asname or alias.name)
-            elif isinstance(node, ast.ImportFrom):
-                if node.module:
-                    for alias in node.names:
-                        if alias.name == "*":
-                            return SidecarLoadResult(error="Wildcard import not allowed")
-                        defined_names.append(alias.asname or alias.name)
-            elif isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name):
-                        defined_names.append(target.id)
-            elif isinstance(node, ast.ClassDef):
-                return SidecarLoadResult(error=f"Class '{node.name}' not allowed in sidecar")
-            # Allow ast.Expr (docstrings), ast.AnnAssign, ast.AugAssign
-            elif isinstance(node, (ast.Expr, ast.AnnAssign, ast.AugAssign)):
-                pass
-            else:
-                return SidecarLoadResult(
-                    error=f"Unsupported construct: {type(node).__name__}"
+                async with asyncio.timeout(request.timeout_ms / 1000):
+                    async for event in self._read_until_complete(request.id):
+                        yield event
+            except TimeoutError:
+                await self.stop()
+                yield KernelEvent(
+                    id=request.id, type="complete", ok=False,
+                    payload={"code": "timeout"},
                 )
-        return SidecarLoadResult(names=defined_names)
-    except SyntaxError as e:
-        return SidecarLoadResult(error=f"Syntax error: {e}")
+
+    async def _read_until_complete(self, request_id: str) -> AsyncIterator[KernelEvent]:
+        assert self._process and self._process.stdout
+        while line := await self._process.stdout.readline():
+            event = KernelEvent.model_validate_json(line)
+            if event.id != request_id:
+                continue
+            yield event
+            if event.type == "complete":
+                return
+        raise RuntimeError("kernel worker terminated before complete event")
+
+    async def stop(self) -> None:
+        if not self._process or self._process.returncode is not None:
+            return
+        self._process.terminate()
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(self._process.wait(), timeout=2)
+        if self._process.returncode is None:
+            self._process.kill()
+            await self._process.wait()
 ```
 
-### 2. 注册执行工具
+每个 Frame 使用一个 kernel，Frame 结束或超时后销毁。每次执行都复用该 Frame 的 namespace，不能跨项目复用解释器状态。
+
+### 3. Worker 只实现协议，不承担隔离
 
 ```python
-# src/scientex_agent/tools.py 中添加
+# src/scientex_agent/kernel_worker.py（核心循环，省略富显示支持）
+from __future__ import annotations
 
-def register_kernel_tools(registry: ToolRegistry, kernel: SubprocessPythonKernel) -> None:
+import ast
+import contextlib
+import io
+import json
+import sys
+import traceback
+from typing import Any
 
-    @registry.register(
-        name="execute_python",
-        description="Execute Python code in a persistent kernel. "
-                    "Variables persist between calls. "
-                    "Use for data analysis, visualization, calculations.",
-        parameters={
-            "type": "object",
-            "properties": {
-                "code": {
-                    "type": "string",
-                    "description": "Python code to execute. Can be multi-line."
-                },
-            },
-            "required": ["code"],
-        },
-    )
-    def execute_python(code: str) -> dict:
-        result = kernel.execute(code)
-        return {
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "exit_status": result.exit_status,
-            "error": result.error,
-        }
+namespace: dict[str, Any] = {"__name__": "__scientex_kernel__"}
+
+
+def emit(event: dict[str, Any]) -> None:
+    sys.__stdout__.write(json.dumps(event, ensure_ascii=False) + "\n")
+    sys.__stdout__.flush()
+
+
+def execute(request: dict[str, Any]) -> None:
+    request_id = request["id"]
+    stdout, stderr = io.StringIO(), io.StringIO()
+    try:
+        module = ast.parse(request["code"], mode="exec")
+        tail: ast.expr | None = None
+        if module.body and isinstance(module.body[-1], ast.Expr):
+            tail = module.body.pop().value
+
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            exec(compile(module, "<scientex-cell>", "exec"), namespace)
+            value = eval(compile(ast.Expression(tail), "<scientex-cell>", "eval"), namespace) if tail else None
+
+        if stdout.getvalue():
+            emit({"id": request_id, "type": "stdout", "text": stdout.getvalue()[:65_536]})
+        if stderr.getvalue():
+            emit({"id": request_id, "type": "stderr", "text": stderr.getvalue()[:65_536]})
+        if tail is not None:
+            emit({"id": request_id, "type": "result", "value_repr": repr(value)[:16_384],
+                  "mime": "text/plain"})
+        emit({"id": request_id, "type": "complete", "ok": True})
+    except Exception as error:
+        emit({"id": request_id, "type": "error", "payload": {
+            "code": "execution_error", "message": str(error),
+            "traceback": traceback.format_exc(limit=20),
+        }})
+        emit({"id": request_id, "type": "complete", "ok": False})
+
+
+for line in sys.stdin:
+    execute(json.loads(line))
 ```
+
+真实 worker 还应实现取消消息、输出计数而不是简单截断、图像 MIME 输出和 capability RPC。关键是把这些增强留在协议层，避免前端或 Agent 依赖 Python 的打印格式。
+
+### 4. 将执行记录为产物候选
+
+每个 kernel event 都带 `run_id`、`frame_id`、开始/结束时间、kernel image/version 和 code SHA-256。代码、stdout、stderr、生成文件先写入临时运行目录；Step 12 再将被用户保留的结果升级为版本化 Artifact。
 
 ## 验证
 
-```python
-from scientex_agent.kernel import SubprocessPythonKernel
-from pathlib import Path
+```bash
+# 启动一个可信本地内核并执行一段确定性代码
+uv run scientex_agent kernel run --code 'import math; math.factorial(6)'
 
-kernel = SubprocessPythonKernel(Path("/tmp/kernel-test"))
+# 同一 Frame 下第二段代码能读到第一段变量
+uv run scientex_agent kernel repl --frame demo
+>>> x = 21
+>>> x * 2
 
-# 基本执行
-result = kernel.execute("x = sum(range(100))\nprint(f'sum = {x}')")
-assert "sum = 4950" in result.stdout
-assert result.exit_status == "ok"
-
-# 状态保持
-result = kernel.execute("print(f'x * 2 = {x * 2}')")
-assert "x * 2 = 9900" in result.stdout
-
-# 错误处理
-result = kernel.execute("1/0")
-assert result.exit_status == "error"
-assert "division by zero" in result.stderr
-
-kernel.close()
+# 无穷循环必须在 timeout 后返回失败，内核随后可重启
+uv run scientex_agent kernel run --timeout-ms 200 --code 'while True: pass'
 ```
+
+测试应覆盖：尾表达式、stdout/stderr、语法错误、超时后的进程回收、Frame 间 namespace 隔离，以及超过输出上限时的明确事件。对 `isolated` 运行器，另写集成测试确认网络、写入目录和资源限制确实由运行环境强制执行。
 
 ## 深入理解
 
-### 为什么用子进程
+### 为什么子进程不是安全边界
 
-1. **隔离**：用户代码崩溃不会影响 agent 主进程
-2. **安全性**：可以限制文件系统访问、网络访问
-3. **资源限制**：可以用 `resource` 模块限制 CPU/内存
-4. **可清理**：子进程可以被 kill，资源会被 OS 回收
+子进程仍与主进程拥有同一用户权限，可能读取用户可读的文件、访问网络或消耗机器资源。它用于故障隔离和生命周期管理；面对敌对代码，必须使用操作系统权限、容器或微虚拟机，并将宿主目录以最小、只读方式挂载。
 
-### host 回调的安全考虑
+### 为什么保留状态但不无限保留
 
-```python
-# 在内核中，用户可以调用
-host.llm("Generate malicious content")    # → 通过 host_call_handler 进行
-host.read_file("/etc/passwd")            # → 应该在 handler 层做路径检查
-```
-
-所有 host 回调都应该：
-1. 记录日志（谁调用了什么）
-2. 验证参数（路径检查、权限检查）
-3. 限制频率（防止滥用）
-
-### 技能侧车注入
-
-技能可以包含 `kernel.py` 文件，在 kernel 启动时自动加载：
-
-```python
-# skills/data-analysis/kernel.py
-import pandas as pd
-import numpy as np
-
-def load_dataset(path: str):
-    """Load a CSV or Excel file."""
-    if path.endswith(".csv"):
-        return pd.read_csv(path)
-    elif path.endswith((".xls", ".xlsx")):
-        return pd.read_excel(path)
-    raise ValueError(f"Unsupported format: {path}")
-```
-
-注入方式：在每次 `execute()` 时 prepend 侧车代码到 source 前面。
+Notebook 式分析需要 `x` 在下一格可用，但长期状态会导致不可复现和内存膨胀。一个 Frame 的 kernel 生命周期、可见 package 版本、输入 Artifact 和 code hash 都应记录；用户需要复现时，使用干净运行器重放这些输入。
 
 ## 当前局限
 
-1. 没有超时控制（死循环会永远挂起）
-2. 没有内存限制
-3. 文件系统访问无沙箱
-4. 没有多内核管理（一个 frame 一个内核）
+- `trusted-local` 不是不可信代码沙箱，且还没有容器运行器实现。
+- 第一版一次只执行一个 cell，不支持并发 cell 或 notebook 协作。
+- 还没有把 DataFrame、图像和文件自动转换为 Artifact；这属于 Step 12 的产物层。
 
 ## 下一步
 
-→ [10-agent-loop.md](10-agent-loop.md)
+下一章把 Provider、内置工具、MCP、Skill 和 Kernel 放入一个可恢复的 Agent 工作流。执行前的策略检查和人工审批会在编排层完成。

@@ -15,11 +15,11 @@
 | 组件 | 选型 | 说明 |
 |---|---|---|
 | LLM SDK | `openai >= 2.46` | 统一 OpenAI 兼容接口 |
-| Agent 编排 | `langgraph >= 0.2` | 从手写循环逐步迁移到 StateGraph |
-| MCP 协议 | `mcp >= 1.9` | 官方 SDK，不自研客户端 |
+| Agent 编排 | `langgraph >= 1.0` | 显式 StateGraph、checkpoint、审批中断与恢复 |
+| MCP 协议 | `mcp >= 1.9` | 官方 SDK；本地 stdio、远程 Streamable HTTP |
 | Web 框架 | `fastapi >= 0.110` + `uvicorn` | 异步 HTTP + SSE 流式 |
 | 存储 | SQLite（内嵌） + 文件系统 | 零配置，适合本地桌面应用 |
-| 前端 | Vanilla JS SPA | 无框架依赖，单文件构建 |
+| 前端 | Vue 3 + TypeScript + Vite | 组件化 UI、类型检查、Pinia 状态与 Vite 构建 |
 | 包管理 | `uv` | 快速、现代、兼容 pip |
 
 ## 前置条件
@@ -54,7 +54,7 @@ Phase 4: 应用服务 ───────────────────�
   13  CLI                argparse 命令行
                                 │
 Phase 5: 界面与领域 ─────────────────────────────
-  14  Web 前端           SPA, 对话界面, 文件浏览器
+  14  Web 前端           Vue 3 SPA, 流式对话, 项目与产物界面
   15  领域功能           生物工具, 化学编辑器, 记忆, 验证
   16  生产化             备份恢复, 错误处理, 打包分发
 ```
@@ -163,7 +163,7 @@ scientex_agent/
 │   ├── agent_graph.py       # LangGraph 编排 (Step 10)
 │   ├── api.py               # FastAPI HTTP 服务 (Step 11)
 │   ├── project_manager.py   # 多项目管理 (Step 12)
-│   └── web/                 # 前端静态文件 (Step 14)
+│   └── web/                 # Vue 3 + TypeScript 源码与构建产物 (Step 14)
 ├── tests/                   # 测试用例
 └── docs/tutorial/           # 本教程
 ```

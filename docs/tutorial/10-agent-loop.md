@@ -2,681 +2,292 @@
 
 ## 目标
 
-将之前各步骤的能力（对话、工具、MCP、技能、内核）整合为一个基于 LangGraph 的完整 Agent 编排系统。
+将 Provider、持久化会话、内置/MCP 工具、Skill 和 Python Kernel 组合为一个可恢复、可观测、可人工审批的 Agent 工作流。LangGraph 只负责编排和状态恢复；Step 05 的 provider adapter 仍是模型调用的唯一边界。
 
 ## 前置条件
 
 - 完成 [09-python-kernel.md](09-python-kernel.md)
-- 理解前 9 步的所有概念
+- 理解消息、工具和 Frame 的持久化模型
+
+## 与前九步的边界
+
+前九步分别证明了能力可以工作。本章不把它们重新实现为 LangChain 专用对象，也不把所有业务逻辑塞进一个 graph node。每个节点调用已有的领域服务：
+
+```
+Provider adapter  →  统一模型请求
+Tool registry     →  统一工具 schema / 执行
+MCPManager        →  连接生命周期与外部调用
+SkillCatalog      →  按需读取、带版本的操作知识
+PythonKernel      →  受控代码运行
+MetadataStore     →  Project / Frame / Message
+```
+
+Graph 负责决定顺序、保存 checkpoint、在危险操作前暂停，并把状态变化输出为统一 run events。
 
 ## 设计思路
 
-### 为什么要用 LangGraph
+### 从循环到状态机
 
-在第 4 步中，我们手写了一个简单的 tool-calling 循环。但随着系统变复杂，手写循环面临：
+```
+START → prepare → model ──无 tool call──→ persist → END
+                  │
+                  └─有 tool call→ policy → tools ─┬→ model
+                                      │            │
+                                      └─需审批→ interrupt
+```
+
+每条边都是显式契约。这样可以回答三个很实际的问题：
+
+- 进程在工具执行后崩溃，是否能从最近成功状态恢复？
+- 写文件或运行代码前，谁检查过权限、用户是否审批？
+- 前端正在流式显示时，如何知道这是 token、工具开始、审批请求还是最终完成？
+
+### 状态只保存可序列化业务数据
+
+不要把 socket、SDK client、数据库连接或 Python coroutine 放进 graph state。它们属于应用依赖，由 node 在运行时取得；state 只保存可持久化的数据。
 
 ```python
-# 手写循环的复杂性（当前 scientex 的 conversation_execution.py 有 512 行）
-for _round in range(max_rounds):
-    response = provider.chat(request)
-    if tool_calls:
-        for call in tool_calls:
-            result = execute_tool(call)
-            # 还需要处理：
-            # - 流式输出中的 tool call 聚合
-            # - 错误恢复
-            # - 消息裁剪/压缩
-            # - DMIL fallback（文本嵌入式工具调用）
-            # - 中断和恢复
-            # ...
-```
+# src/scientex_agent/agent_state.py
+from __future__ import annotations
 
-LangGraph 把这些复杂性建模为**有向图**：
+from typing import Any, Literal, NotRequired, TypedDict
 
-```
-         ┌──────────┐
-         │  START   │
-         └────┬─────┘
-              │
-         ┌────▼─────┐     有 tool_calls      ┌──────────┐
-         │   LLM    │───────────────────────→│  TOOLS   │
-         │   Node   │                        │   Node   │
-         └────┬─────┘←───────────────────────└──────────┘
-              │ 无 tool_calls
-         ┌────▼─────┐
-         │   END    │
-         └──────────┘
-```
 
-### LangGraph 核心概念
+class ToolIntent(TypedDict):
+    id: str
+    name: str
+    arguments: dict[str, Any]
+    risk: Literal["read", "write", "execute", "network"]
 
-```python
-from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import ToolNode
-from langgraph.checkpoint.memory import MemorySaver
 
-# 1. 定义状态
 class AgentState(TypedDict):
-    messages: Annotated[list, add_messages]
-
-# 2. 定义节点（函数）
-def call_model(state: AgentState):
-    response = model.invoke(state["messages"])
-    return {"messages": [response]}
-
-# 3. 定义路由（条件边）
-def should_continue(state: AgentState):
-    last = state["messages"][-1]
-    if last.tool_calls:
-        return "tools"
-    return END
-
-# 4. 构建图
-graph = StateGraph(AgentState)
-graph.add_node("agent", call_model)
-graph.add_node("tools", ToolNode(tools))
-graph.add_edge("tools", "agent")       # 执行完工具后回到 agent
-graph.add_conditional_edges("agent", should_continue)
-graph.set_entry_point("agent")
-
-# 5. 编译（可加 checkpointer）
-app = graph.compile(checkpointer=MemorySaver())
+    frame_id: str
+    run_id: str
+    messages: list[dict[str, Any]]
+    selected_skill_ids: list[str]
+    pending_tools: list[ToolIntent]
+    approved_tool_ids: list[str]
+    tool_rounds: int
+    max_tool_rounds: int
+    final_text: NotRequired[str]
+    error: NotRequired[dict[str, str]]
 ```
 
-### 本次 Agent 的图结构
+`frame_id` 是产品层会话标识，`run_id` 是一次执行标识；两者不能混用。每个 node 只返回自己改变的字段，避免并发时用隐藏可变对象修改 state。
+
+### 可恢复不等于可重放副作用
+
+Checkpoint 可以恢复状态，却不能让外部世界自动回滚。因此每次有副作用的工具调用都需要 idempotency key：
 
 ```
-                    ┌─────────┐
-                    │  START  │
-                    └────┬────┘
-                         │
-                    ┌────▼─────┐
-                    │  build   │  构建 system prompt + 消息历史
-                    │  prompt  │
-                    └────┬─────┘
-                         │
-                    ┌────▼─────┐     有 tool_calls     ┌─────────┐
-                    │   LLM    │──────────────────────→│  tools  │
-                    └────┬─────┘                       └────┬────┘
-                         │ 无 tool_calls                   │
-                    ┌────▼─────┐                       ←───┘
-                    │  record  │  记录消息到 metadata
-                    │  message │
-                    └────┬─────┘
-                         │
-                    ┌────▼─────┐
-                    │   END    │
-                    └──────────┘
+run_id + tool_call_id → tool_execution_id
 ```
+
+恢复时先查询该 execution 是否已有终态；已有则复用结构化结果，未开始才执行。对不可幂等操作（发邮件、下单、写外部数据库）必须经过审批，并在工具层提供业务去重。
 
 ## 实现
 
-### 1. 添加依赖
+### 1. 添加编排与 checkpoint 依赖
 
 ```toml
-# pyproject.toml 新增
+# pyproject.toml
+[project]
 dependencies = [
-    ...
-    "langgraph>=0.2.0",
-    "langchain-core>=0.3.0",
-    "langchain-openai>=0.2.0",
+    # ...
+    "langgraph>=1.0",
+    "langgraph-checkpoint-sqlite>=2.0",
 ]
 ```
 
-```bash
-uv sync
-```
+生产环境使用与请求模式匹配的持久化 checkpointer；内存 checkpointer 只适合单元测试。SQLite 适合单机开发和单进程部署，多个 worker 共享写入时应迁移到支持并发的数据库。
 
-### 2. 创建 src/scientex_agent/agent_graph.py
+### 2. 用节点封装业务操作
 
 ```python
-"""LangGraph-based agent orchestration.
-
-Replaces the hand-written agent loop with a declarative StateGraph.
-"""
-
+# src/scientex_agent/agent_graph.py
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
-from typing import Annotated, Any, TypedDict
+import asyncio
+from dataclasses import dataclass
+from typing import Literal
 
-from langchain_core.messages import (
-    AIMessage,
-    BaseMessage,
-    HumanMessage,
-    SystemMessage,
-    ToolMessage,
-    trim_messages,
-)
-from langchain_core.tools import BaseTool
-from langchain_openai import ChatOpenAI
-from langgraph.graph import END, StateGraph
-from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import interrupt
 
-from .provider_types import ChatMessage
+from .agent_state import AgentState
 
 
-# === Agent State ===
-
-class AgentState(TypedDict):
-    """State that flows through the agent graph."""
-    messages: Annotated[list[BaseMessage], add_messages]
-    system_prompt: str | None
-    frame_id: str | None
-    model: str
+@dataclass(frozen=True)
+class AgentDependencies:
+    app: "ScientexApp"
+    policy: "ToolPolicy"
+    events: "RunEventSink"
 
 
-# === Tool Conversion ===
-
-def convert_tools_for_langgraph(registry) -> list[BaseTool]:
-    """Convert our ToolRegistry tools to LangGraph-compatible tools.
-
-    This bridges the gap between our existing tool system and LangGraph's tool system.
-    """
-    from langchain_core.tools import StructuredTool
-    from pydantic import create_model
-    import json
-
-    tools = []
-    for schema in registry.schemas():
-        func = schema["function"]
-        name = func["name"]
-        description = func.get("description", "")
-        params = func.get("parameters", {"type": "object", "properties": {}})
-
-        # Create a simple wrapper
-        def make_handler(n):
-            def handler(**kwargs) -> str:
-                result = registry.execute(n, kwargs)
-                return json.dumps(result, ensure_ascii=False)
-            return handler
-
-        # Build pydantic model from JSON Schema (simplified)
-        fields = {}
-        for prop_name, prop_info in params.get("properties", {}).items():
-            prop_type = str
-            if prop_info.get("type") == "integer":
-                prop_type = int
-            elif prop_info.get("type") == "number":
-                prop_type = float
-            elif prop_info.get("type") == "boolean":
-                prop_type = bool
-            required = prop_name in params.get("required", [])
-            if required:
-                fields[prop_name] = (prop_type, ...)
-            else:
-                fields[prop_name] = (prop_type, None)
-
-        tool_model = create_model(f"Args_{name}", **fields) if fields else None
-        tool = StructuredTool.from_function(
-            func=make_handler(name),
-            name=name,
-            description=description,
-            args_schema=tool_model,
-        )
-        tools.append(tool)
-
-    return tools
+async def prepare(state: AgentState, deps: AgentDependencies) -> dict:
+    frame = deps.app.get_frame_or_raise(state["frame_id"])
+    messages = deps.app.load_prompt_messages(frame)
+    await deps.events.emit("run.started", {"run_id": state["run_id"]})
+    return {"messages": messages, "tool_rounds": 0, "max_tool_rounds": 8}
 
 
-# === Agent Graph ===
-
-class AgentGraph:
-    """LangGraph-based agent that orchestrates LLM + tools.
-
-    Usage::
-
-        graph = AgentGraph(llm=llm_client, tools=[...])
-        app = graph.compile()
-
-        # Non-streaming
-        result = await app.ainvoke({"messages": [HumanMessage(content="Hello")]})
-
-        # Streaming
-        async for event in app.astream_events({"messages": [...]}, version="v2"):
-            ...
-    """
-
-    def __init__(
-        self,
-        *,
-        llm: ChatOpenAI,
-        tools: list[BaseTool] | None = None,
-        checkpointer: Any = None,
-        max_tool_rounds: int = 30,
-        max_message_tokens: int = 8000,
-    ) -> None:
-        self.llm = llm.bind_tools(tools or [])
-        self.tools = tools or []
-        self.checkpointer = checkpointer or MemorySaver()
-        self.max_tool_rounds = max_tool_rounds
-        self.max_message_tokens = max_message_tokens
-        self._graph = self._build()
-
-    def _build(self) -> StateGraph:
-        workflow = StateGraph(AgentState)
-
-        # LLM node
-        async def call_model(state: AgentState) -> dict:
-            messages = list(state.get("messages", []))
-
-            # Prepend system prompt if present
-            if state.get("system_prompt"):
-                # Only prepend if the first message isn't already a system message
-                if not messages or not isinstance(messages[0], SystemMessage):
-                    messages.insert(0, SystemMessage(content=state["system_prompt"]))
-
-            # Trim messages to fit context
-            trimmed = trim_messages(
-                messages,
-                max_tokens=self.max_message_tokens,
-                strategy="last",
-                token_counter=self.llm,
-                include_system=True,
-                start_on="human",
-                allow_partial=False,
-            )
-
-            response = await self.llm.ainvoke(trimmed)
-            return {"messages": [response]}
-
-        workflow.add_node("agent", call_model)
-        workflow.add_node("tools", ToolNode(self.tools))
-
-        # Routing
-        def route_after_agent(state: AgentState) -> str:
-            messages = state.get("messages", [])
-            if not messages:
-                return END
-            last = messages[-1]
-            if isinstance(last, AIMessage) and last.tool_calls:
-                return "tools"
-            return END
-
-        workflow.add_conditional_edges("agent", route_after_agent)
-        workflow.add_edge("tools", "agent")
-        workflow.set_entry_point("agent")
-
-        return workflow
-
-    def compile(self, **kwargs):
-        """Compile the graph into a runnable app."""
-        return self._graph.compile(checkpointer=self.checkpointer, **kwargs)
-
-    async def run(
-        self,
-        messages: list[BaseMessage],
-        *,
-        system_prompt: str | None = None,
-        thread_id: str | None = None,
-    ) -> dict:
-        """Non-streaming agent run.
-
-        Args:
-            messages: Initial messages.
-            system_prompt: Optional system prompt.
-            thread_id: Thread ID for checkpointing (enables conversation continuity).
-
-        Returns:
-            Final graph state.
-        """
-        app = self.compile()
-        config = {"configurable": {"thread_id": thread_id or "default"}} if thread_id else {}
-        initial_state: AgentState = {
-            "messages": messages,
-            "system_prompt": system_prompt,
-            "frame_id": None,
-            "model": "",
-        }
-        return await app.ainvoke(initial_state, config)  # type: ignore[arg-type]
-
-    async def stream(
-        self,
-        messages: list[BaseMessage],
-        *,
-        system_prompt: str | None = None,
-        thread_id: str | None = None,
-    ) -> AsyncGenerator[dict, None]:
-        """Streaming agent run.
-
-        Yields events as they occur:
-        - {"token": "text"} — text token from LLM
-        - {"tool_start": {"name": "..."}} — tool execution begins
-        - {"tool_end": {"name": "...", "result": "..."}} — tool execution ends
-        - {"done": True} — agent finished
-        """
-        app = self.compile()
-        config = {"configurable": {"thread_id": thread_id or "default"}} if thread_id else {}
-        initial_state: AgentState = {
-            "messages": messages,
-            "system_prompt": system_prompt,
-            "frame_id": None,
-            "model": "",
-        }
-
-        async for event in app.astream_events(initial_state, config, version="v2"):  # type: ignore[arg-type]
-            kind = event.get("event", "")
-
-            if kind == "on_chat_model_stream":
-                content = event["data"]["chunk"].content
-                if content:
-                    yield {"token": content}
-
-            elif kind == "on_tool_start":
-                yield {
-                    "tool_start": {
-                        "name": event.get("name", ""),
-                        "input": event["data"].get("input", {}),
-                    }
-                }
-
-            elif kind == "on_tool_end":
-                yield {
-                    "tool_end": {
-                        "name": event.get("name", ""),
-                        "output": event["data"].get("output", ""),
-                    }
-                }
-
-        yield {"done": True}
+async def call_model(state: AgentState, deps: AgentDependencies) -> dict:
+    response = await deps.app.provider_chat(
+        frame_id=state["frame_id"],
+        messages=state["messages"],
+        skill_ids=state["selected_skill_ids"],
+    )
+    await deps.events.emit_model_response(response)
+    return {
+        "messages": [*state["messages"], response.message],
+        "pending_tools": response.tool_intents,
+        "final_text": response.text if not response.tool_intents else "",
+    }
 
 
-# === Helper: Convert internal messages to LangChain format ===
+async def check_policy(state: AgentState, deps: AgentDependencies) -> dict:
+    decisions = [deps.policy.decide(state["frame_id"], item)
+                 for item in state["pending_tools"]]
+    denied = [item.name for item, decision in zip(state["pending_tools"], decisions)
+              if decision.kind == "deny"]
+    if denied:
+        return {"error": {"code": "tool_denied", "message": ", ".join(denied)}}
 
-def to_langchain_messages(messages: list[ChatMessage]) -> list[BaseMessage]:
-    """Convert our internal ChatMessage list to LangChain format."""
-    result = []
-    for msg in messages:
-        if msg.role == "system":
-            result.append(SystemMessage(content=msg.content))
-        elif msg.role == "user":
-            result.append(HumanMessage(content=msg.content))
-        elif msg.role == "assistant":
-            ai_msg = AIMessage(content=msg.content)
-            if msg.tool_calls:
-                from langchain_core.messages import ToolCall as LCToolCall
-                ai_msg.tool_calls = [
-                    LCToolCall(
-                        id=tc.id,
-                        name=tc.name,
-                        args=tc.arguments,
-                    )
-                    for tc in msg.tool_calls
-                ]
-            result.append(ai_msg)
-        elif msg.role == "tool":
-            result.append(ToolMessage(
-                content=msg.content,
-                tool_call_id=msg.tool_call_id or "",
-            ))
-    return result
+    approval = [item for item, decision in zip(state["pending_tools"], decisions)
+                if decision.kind == "require_approval"]
+    if approval:
+        answer = interrupt({
+            "kind": "tool_approval",
+            "run_id": state["run_id"],
+            "tools": approval,
+        })
+        approved = set(answer.get("approved_tool_ids", []))
+        return {"approved_tool_ids": list(approved)}
+    return {"approved_tool_ids": [item["id"] for item in state["pending_tools"]]}
+
+
+async def execute_tools(state: AgentState, deps: AgentDependencies) -> dict:
+    results = await deps.app.execute_idempotent_tools(
+        frame_id=state["frame_id"],
+        run_id=state["run_id"],
+        tools=state["pending_tools"],
+        approved_ids=set(state["approved_tool_ids"]),
+    )
+    await deps.events.emit_tool_results(results)
+    tool_messages = [result.as_message() for result in results]
+    return {
+        "messages": [*state["messages"], *tool_messages],
+        "pending_tools": [],
+        "tool_rounds": state["tool_rounds"] + 1,
+    }
+
+
+async def persist(state: AgentState, deps: AgentDependencies) -> dict:
+    await deps.app.persist_run(state)
+    await deps.events.emit("run.completed", {
+        "run_id": state["run_id"], "text": state.get("final_text", ""),
+    })
+    return {}
 ```
 
-### 3. 整合：创建 ScientexApp 门面
+`ToolPolicy` 是普通、可单测的领域对象，而不是散落在 prompt 中的自然语言。对 `execute`、`write` 和跨信任边界的 `network` 操作，它默认要求审批；只读工具可以按项目策略自动通过。
+
+### 3. 构建图和路由
 
 ```python
-# src/scientex_agent/app.py
-
-"""Application facade — wires all services together."""
-
-from __future__ import annotations
-
-from pathlib import Path
-
-from .agent_graph import AgentGraph, convert_tools_for_langgraph
-from .metadata import MetadataStore
-from .skill_catalog import SkillCatalog
-from .tools import ToolRegistry, register_default_tools, register_skill_tools
-from .kernel import SubprocessPythonKernel
-from .providers import build_default_registry
-from .provider_registry import LangChainLLMProvider
+def route_after_model(state: AgentState) -> Literal["policy", "persist"]:
+    if state.get("error") or not state["pending_tools"]:
+        return "persist"
+    if state["tool_rounds"] >= state["max_tool_rounds"]:
+        return "persist"
+    return "policy"
 
 
-class ScientexApp:
-    """Main application — composition root and facade.
+def route_after_policy(state: AgentState) -> Literal["tools", "persist"]:
+    return "persist" if state.get("error") else "tools"
 
-    Usage::
 
-        app = ScientexApp(Path("~/.scientex_agent"))
-        app.initialize()
+def build_graph(deps: AgentDependencies, checkpointer):
+    graph = StateGraph(AgentState)
+    graph.add_node("prepare", lambda state: prepare(state, deps))
+    graph.add_node("model", lambda state: call_model(state, deps))
+    graph.add_node("policy", lambda state: check_policy(state, deps))
+    graph.add_node("tools", lambda state: execute_tools(state, deps))
+    graph.add_node("persist", lambda state: persist(state, deps))
 
-        # Create a project
-        project = app.create_project(name="My Research")
-
-        # Create a frame (conversation)
-        frame = app.create_frame(project_id=project.id, name="Chat 1")
-
-        # Chat
-        result = await app.chat(frame_id=frame.id, content="Hello!")
-    """
-
-    def __init__(self, data_dir: str | Path) -> None:
-        self.data_dir = Path(data_dir).expanduser().resolve()
-        self.metadata = MetadataStore(self.data_dir / "app.db")
-        self.skills = SkillCatalog()
-        self.kernel: SubprocessPythonKernel | None = None
-        self.providers = build_default_registry()
-        self._graph_cache: dict[str, AgentGraph] = {}
-
-    def initialize(self) -> None:
-        """One-time setup: create directories, init DB, load skills."""
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.metadata.initialize()
-        self.skills.load()
-
-    # === Projects & Frames ===
-
-    def create_project(self, *, name: str, description: str = "", context: str = ""):
-        return self.metadata.create_project(name=name, description=description, context=context)
-
-    def list_projects(self):
-        return self.metadata.list_projects()
-
-    def create_frame(self, *, project_id: str, name: str = ""):
-        return self.metadata.create_frame(project_id=project_id, name=name)
-
-    def list_frames(self, project_id: str):
-        return self.metadata.list_frames(project_id)
-
-    # === Agent ===
-
-    def _build_graph(self, frame_id: str, provider_name: str, model_name: str) -> AgentGraph:
-        """Build or retrieve a cached AgentGraph for a frame."""
-        cache_key = f"{frame_id}:{provider_name}:{model_name}"
-        if cache_key in self._graph_cache:
-            return self._graph_cache[cache_key]
-
-        # Build tools
-        registry = ToolRegistry()
-        register_default_tools(registry)
-        register_skill_tools(registry, self.skills)
-        # MCP tools would be registered here if connected
-
-        langgraph_tools = convert_tools_for_langgraph(registry)
-
-        # Build LLM from the provider selected in Step 05/06.
-        provider = self.providers.get(provider_name)
-        if not isinstance(provider, LangChainLLMProvider):
-            raise TypeError(f"{provider_name} does not support LangGraph yet")
-        llm = provider.to_langchain_chat_model(model_name, streaming=True)
-
-        # Build graph
-        graph = AgentGraph(llm=llm, tools=langgraph_tools)
-        self._graph_cache[cache_key] = graph
-        return graph
-
-    async def chat(self, *, frame_id: str, content: str) -> dict:
-        """Send a message and get the full response."""
-        frame = self.metadata.get_frame(frame_id)
-        if not frame:
-            raise KeyError(f"Unknown frame: {frame_id}")
-
-        # Build system prompt
-        system_prompt = self._build_system_prompt(frame.project_id)
-        self.skills.load()
-        system_prompt += "\n\n" + self.skills.system_prompt_index()
-
-        # Record user message
-        self.metadata.append_message(frame_id=frame_id, role="user", content=content)
-
-        # Load history
-        history = self.metadata.list_messages(frame_id)
-        from .agent_graph import to_langchain_messages
-        messages = to_langchain_messages(history)
-        # Add current message (it's already in history, but we'll let the graph handle it)
-
-        # Build and run agent
-        graph = self._build_graph(frame_id, "openai", "gpt-4o")
-        result = await graph.run(
-            messages=messages,
-            system_prompt=system_prompt,
-            thread_id=frame_id,
-        )
-
-        # Extract and save assistant response
-        final_messages = result.get("messages", [])
-        if final_messages:
-            last = final_messages[-1]
-            if hasattr(last, "content") and last.content:
-                self.metadata.append_message(
-                    frame_id=frame_id, role="assistant", content=last.content
-                )
-
-        return {"content": last.content if hasattr(last, "content") else ""}
-
-    async def chat_stream(self, *, frame_id: str, content: str):
-        """Streaming chat — yields events as they occur."""
-        # Similar to chat() but uses graph.stream()
-        frame = self.metadata.get_frame(frame_id)
-        if not frame:
-            raise KeyError(f"Unknown frame: {frame_id}")
-
-        system_prompt = self._build_system_prompt(frame.project_id)
-        self.skills.load()
-        system_prompt += "\n\n" + self.skills.system_prompt_index()
-
-        self.metadata.append_message(frame_id=frame_id, role="user", content=content)
-
-        history = self.metadata.list_messages(frame_id)
-        from .agent_graph import to_langchain_messages
-        messages = to_langchain_messages(history)
-
-        graph = self._build_graph(frame_id, "openai", "gpt-4o")
-        full_content = ""
-
-        async for event in graph.stream(
-            messages=messages,
-            system_prompt=system_prompt,
-            thread_id=frame_id,
-        ):
-            yield event
-            if "token" in event:
-                full_content += event["token"]
-
-        # Save final response
-        if full_content:
-            self.metadata.append_message(
-                frame_id=frame_id, role="assistant", content=full_content
-            )
-
-    # === Helpers ===
-
-    def _build_system_prompt(self, project_id: str) -> str:
-        """Build the system prompt for a project."""
-        project = self.metadata.get_project(project_id)
-        project_context = project.context if project else ""
-        return (
-            "You are a scientific research assistant powered by Scientex.\n"
-            "You can use tools to search literature, analyze data, and "
-            "execute Python code.\n"
-            "Always cite your sources and explain your reasoning.\n"
-            "\n"
-            f"Project context: {project_context}\n"
-        )
+    graph.add_edge(START, "prepare")
+    graph.add_edge("prepare", "model")
+    graph.add_conditional_edges("model", route_after_model)
+    graph.add_conditional_edges("policy", route_after_policy)
+    graph.add_edge("tools", "model")
+    graph.add_edge("persist", END)
+    return graph.compile(checkpointer=checkpointer)
 ```
+
+实际项目中，node 函数可直接定义为 `async def` 并在图中注册；这里用闭包注入 `deps`，避免用模块级单例保存连接。检查点 config 始终携带稳定的 `thread_id=frame_id`，而一次请求使用独立 `run_id`：
+
+```python
+config = {"configurable": {"thread_id": frame_id}, "metadata": {"run_id": run_id}}
+await graph.ainvoke(initial_state, config=config)
+```
+
+### 4. 定义前端/CLI 都能消费的运行事件
+
+```python
+# src/scientex_agent/run_events.py
+from pydantic import BaseModel
+from typing import Any, Literal
+
+
+class RunEvent(BaseModel):
+    run_id: str
+    seq: int
+    type: Literal[
+        "run.started", "message.delta", "tool.started", "tool.completed",
+        "approval.required", "run.completed", "run.failed",
+    ]
+    data: dict[str, Any]
+```
+
+事件首先是产品 API 契约，Step 11 再将它编码为 SSE。不要将 LangGraph 的内部 callback event 原样暴露给浏览器；内部格式升级不应破坏 Web 客户端。
 
 ## 验证
 
-```python
-import asyncio
-from pathlib import Path
-from scientex_agent.app import ScientexApp
+```bash
+# 普通对话会产生 started、delta、completed 事件
+uv run scientex_agent chat --frame FRAME_ID "解释 PCR 的退火温度"
 
-async def main():
-    app = ScientexApp(Path("/tmp/scientex_agent-test"))
-    app.initialize()
+# 需要写入或执行的工具会暂停，CLI 显示审批项
+uv run scientex_agent chat --frame FRAME_ID "把分析结果保存成 CSV"
 
-    project = app.create_project(name="Test", description="Testing agent graph")
-    frame = app.create_frame(project_id=project.id, name="Chat")
-
-    # Test non-streaming
-    result = await app.chat(frame_id=frame.id, content="What is 2+2?")
-    print(f"Response: {result['content'][:200]}")
-
-    # Test streaming
-    print("Streaming: ", end="")
-    async for event in app.chat_stream(frame_id=frame.id, content="Count from 1 to 5"):
-        if "token" in event:
-            print(event["token"], end="", flush=True)
-        elif "tool_start" in event:
-            print(f"\n[Tool: {event['tool_start']['name']}]", end="")
-        elif "done" in event:
-            print("\n[Done]")
-
-asyncio.run(main())
+# 显示同一 Frame 的 checkpoint，确认可从中断处恢复
+uv run scientex_agent runs inspect --frame FRAME_ID
 ```
+
+至少测试以下情形：
+
+- 无 tool call 的路径不会进入 policy/tools；
+- 第九轮工具调用会停止并给出明确的 `max_tool_rounds` 错误；
+- 用户拒绝审批后，不会调用工具；
+- 同一 `run_id + tool_call_id` 恢复两次，只产生一次外部副作用；
+- 在 `interrupt` 后以同一 `thread_id` 恢复，消息和审批状态完整保留。
 
 ## 深入理解
 
-### LangGraph vs 手写循环
+### 为什么不直接使用预构建 Agent
 
-| 方面 | 手写循环 | LangGraph |
-|---|---|---|
-| 控制流 | 显式 for/if/break | 声明式图 |
-| 流式 | 手动 yield | `.astream_events()` |
-| 状态管理 | 手动管理变量 | TypedDict + reducer |
-| 断点/恢复 | 需要自己实现 | `checkpointer` 开箱即用 |
-| 错误恢复 | try/except 散落各处 | 可加 error node |
-| 可视化 | 无 | `graph.get_graph().draw_mermaid()` |
-| 测试 | 需要 mock 整个循环 | 可单独测试每个 node |
+预构建 Agent 适合原型，但 Scientex 已有 provider adapter、MCP 风险属性、Artifact 审计和 Frame 数据模型。显式图把这些产品约束放在可见的位置，同时仍使用 LangGraph 的 checkpoint、streaming 和 interrupt 能力。
 
-### 为什么绑定工具到 LLM
+### 短期记忆与长期记忆
 
-```python
-llm = ChatOpenAI(model="gpt-4o")
-llm_with_tools = llm.bind_tools(tools)
-```
-
-`bind_tools` 做了两件事：
-1. 把 tool schemas 注入到每次 API 调用的 `tools` 参数
-2. 自动解析响应中的 `tool_calls` 为 LangChain `ToolCall` 对象
-
-### Checkpointer 的作用
-
-```python
-app = graph.compile(checkpointer=MemorySaver())
-
-# 第一次调用
-result = await app.ainvoke({"messages": [HumanMessage(content="我叫张三")]},
-                            config={"configurable": {"thread_id": "conv-1"}})
-
-# 第二次调用（自动加载之前的状态）
-result = await app.ainvoke({"messages": [HumanMessage(content="我叫什么？")]},
-                            config={"configurable": {"thread_id": "conv-1"}})
-# → LLM 知道用户叫张三！
-```
-
-`thread_id` 是对话的标识符，`MemorySaver` 在内存中保存状态。
-可以换成 `SqliteSaver` 实现持久化。
+graph checkpoint 保存一个 Frame 内的短期工作状态；Step 15 的项目/用户记忆是跨 Frame 的长期知识。两者的保留期、权限和检索策略不同，不应混到同一 `messages` 列表。
 
 ## 当前局限
 
-1. `MemorySaver` 在内存中——重启后丢失。生产环境应换 `SqliteSaver`
-2. 没有 human-in-the-loop（中断等待用户确认）
-3. 没有子图（delegate 子任务）
+- 人工审批只有 CLI 交互；Web 端审批卡片在 Step 14 接入。
+- 还没有可视化 trace、离线评测和指标采集；Step 16 加入可观测性与 CI。
+- 单机 SQLite checkpointer 不适合作为多进程服务的共享协调器。
 
 ## 下一步
 
-→ [11-http-api.md](11-http-api.md)
+下一章将 `RunEvent`、Project 和 Frame 公开为版本化 HTTP API，并以 SSE 向客户端传输流式执行结果。

@@ -1,392 +1,241 @@
-# Step 15: 领域功能
+# Step 15: 领域功能（科学工作流、记忆与验证）
 
 ## 目标
 
-集成科学领域特有功能：生物信息学工具、化学分子编辑器、记忆系统、事实验证。
+在通用 Agent 平台上增加可追溯的科研领域能力：受 schema 约束的分析工具、项目范围记忆、结论证据与验证状态。目标不是让模型“看起来懂科学”，而是让每个可交付结论能追到输入、方法、工具版本和证据。
 
 ## 前置条件
 
 - 完成 [14-web-frontend.md](14-web-frontend.md)
-- 理解 MCP 集成 [07-mcp-integration.md](07-mcp-integration.md)
-- 理解技能系统 [08-skill-system.md](08-skill-system.md)
+- 完成 [12-project-management.md](12-project-management.md) 的 Artifact 与 provenance
+- 了解 [08-skill-system.md](08-skill-system.md) 的 Skill 风险模型
 
 ## 设计思路
 
-### 领域功能全景
+### 领域能力是垂直切片
 
 ```
-Scientex 领域功能
-├── 🔬 生物信息学工具
-│   ├── 文献搜索 (PubMed, EuropePMC, arXiv, bioRxiv)
-│   ├── 序列分析 (UniProt, InterPro)
-│   ├── 结构生物学 (PDB, AlphaFold)
-│   ├── 遗传变异 (ClinVar, gnomAD)
-│   ├── 药物/靶点 (ChEMBL)
-│   └── 临床试验 (ClinicalTrials.gov)
-│
-├── ⚗️ 化学工具
-│   └── 分子编辑器 (Ketcher sketcher)
-│
-├── 🧠 记忆系统
-│   └── 跨对话持久记忆
-│
-├── ✅ 事实验证
-│   └── 声明验证和跟踪
-│
-└── 👤 Agent 配置
-    └── 可切换的 agent 角色和系统提示
+用户问题
+  → Skill：选择 SOP 与允许的工具
+  → Domain tool：Pydantic 输入 / 输出、确定性实现、版本
+  → Artifact：原始输入、结果、图表、参数
+  → Verification：声明、证据、状态
+  → Vue：结果、来源、警告、可复现入口
 ```
 
-### 架构模式
+不要把生物信息学算法直接写进 prompt，也不要让前端重新计算研究结论。领域工具封装在 Python 服务中，使用清晰 schema 和独立测试；工具调用结果只是一条消息，真正的结果要保存为 Artifact version。
 
-所有领域功能通过同一模式接入：
+### 三类记忆，三种权限
+
+| 类型 | 范围 | 例子 | 默认策略 |
+|---|---|---|---|
+| 短期工作记忆 | 单一 Frame | 当前检索式、待审批工具 | graph checkpoint，Frame 结束后可归档 |
+| 项目记忆 | 单一 Project | 样本命名、研究目标、已确认偏好 | 用户可查看、编辑、删除 |
+| 用户长期偏好 | 跨 Project | 默认语言、单位偏好 | 明确 opt-in，绝不从敏感原始数据自动推断 |
+
+记忆不是聊天全文的另一个副本。它必须有来源、置信度、有效期与删除机制；检索到的记忆只作为上下文提示，不能覆盖当前用户输入或证据。
+
+### 验证状态不是“真实 / 虚假”二元标签
+
+对科研回答更诚实的模型是：
 
 ```
-1. 数据源/服务（本地或远程）
-   ↓
-2. MCP Server 或直接 HTTP 调用
-   ↓
-3. Tool Registry（统一注册）
-   ↓
-4. Agent 通过工具调用使用
+draft → supported | insufficient_evidence | contradicted | needs_review
 ```
 
-**关键原则**：领域功能是**内容**而不是**架构**。核心架构不需要因为增加领域功能而改变。
+状态来自可检查的 evidence，且显示范围和局限。例如“在已检索的 25 篇文章中有 18 篇支持”不等价于“科学上已证实”。
 
 ## 实现
 
-### 1. 生物信息学工具集成
+### 1. 用 Pydantic 定义领域工具契约
+
+以下以 DNA 序列基础统计为例。它是确定性的、无网络、只读工具，适合作为第一个垂直切片；真实测序/数据库工具沿用同一结构。
 
 ```python
-# src/scientex_agent/bio_tools.py
+# src/scientex_agent/domain/sequence_stats.py
+from __future__ import annotations
 
-"""Bioinformatics tool integration via MCP servers.
+import hashlib
+from collections import Counter
+from typing import Literal
 
-Each domain has its own MCP server. Tools are discovered and registered
-dynamically when the server starts.
-"""
-
-DOMAIN_SERVERS = {
-    "literature": {
-        "command": "python",
-        "args": ["-m", "scientex_agent.bundled_bio_tools.lib.mcp_literature.run_server"],
-        "description": "PubMed, EuropePMC, arXiv, bioRxiv — search and fetch papers",
-    },
-    "protein_annotation": {
-        "command": "python",
-        "args": ["-m", "scientex_agent.bundled_bio_tools.lib.mcp_protein_annotation.run_server"],
-        "description": "UniProt, InterPro, QuickGO — protein sequence and function",
-    },
-    "human_genetics": {
-        "command": "python",
-        "args": ["-m", "scientex_agent.bundled_bio_tools.lib.mcp_human_genetics.run_server"],
-        "description": "ClinVar, gnomAD, CADD — human genetic variation",
-    },
-    "structure_interactions": {
-        "command": "python",
-        "args": ["-m", "scientex_agent.bundled_bio_tools.lib.mcp_structure_interactions.run_server"],
-        "description": "PDB, AlphaFold, STRING — protein structures and interactions",
-    },
-    "chembl": {
-        "command": "python",
-        "args": ["-m", "scientex_agent.bundled_bio_tools.lib.mcp_chembl.run_server"],
-        "description": "ChEMBL — bioactive molecules, targets, drugs",
-    },
-    # ... 更多领域服务器
-}
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
-class BioToolManager:
-    """Manages the lifecycle of bio MCP servers.
+class SequenceStatsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
-    Servers are started lazily — only when a tool from that domain
-    is first requested.
-    """
+    sequence: str = Field(min_length=1, max_length=5_000_000)
+    alphabet: Literal["DNA"] = "DNA"
 
-    def __init__(self) -> None:
-        self._servers: dict[str, SyncMCPServer] = {}
-        self._tools: dict[str, str] = {}  # tool_name → domain
+    @field_validator("sequence")
+    @classmethod
+    def normalize_sequence(cls, value: str) -> str:
+        normalized = "".join(value.upper().split())
+        invalid = sorted(set(normalized) - set("ACGTN"))
+        if invalid:
+            raise ValueError(f"invalid DNA bases: {''.join(invalid)}")
+        return normalized
 
-    def start_domain(self, domain: str) -> list[dict]:
-        """Start an MCP server for a domain and return its tools."""
-        if domain not in DOMAIN_SERVERS:
-            raise ValueError(f"Unknown domain: {domain}")
 
-        cfg = DOMAIN_SERVERS[domain]
-        server = SyncMCPServer(
-            command=cfg["command"],
-            args=cfg["args"],
-            server_name=domain,
-        )
-        tools = server.start()
-        self._servers[domain] = server
-        for tool in tools:
-            full_name = f"bio_{domain}_{tool['name']}"
-            self._tools[full_name] = domain
-        return tools
+class SequenceStatsOutput(BaseModel):
+    model_config = ConfigDict(frozen=True)
 
-    def call_tool(self, domain: str, tool_name: str, args: dict) -> str:
-        """Call a tool on a domain's MCP server."""
-        if domain not in self._servers:
-            self.start_domain(domain)
-        return self._servers[domain].call_tool(tool_name, args)
+    length: int
+    gc_fraction: float | None
+    counts: dict[str, int]
+    sequence_sha256: str
+    tool_version: str = "1.0.0"
 
-    def search_tools(self, query: str) -> list[dict]:
-        """Search all bio tools by keyword."""
-        results = []
-        query_lower = query.lower()
-        for domain, cfg in DOMAIN_SERVERS.items():
-            if query_lower in domain.lower() or query_lower in cfg["description"].lower():
-                results.append({"domain": domain, "description": cfg["description"]})
-        return results
 
-    def close_all(self) -> None:
-        for server in self._servers.values():
-            server.close()
+def sequence_stats(data: SequenceStatsInput) -> SequenceStatsOutput:
+    counts = Counter(data.sequence)
+    defined = counts["A"] + counts["C"] + counts["G"] + counts["T"]
+    return SequenceStatsOutput(
+        length=len(data.sequence),
+        gc_fraction=(counts["G"] + counts["C"]) / defined if defined else None,
+        counts={base: counts[base] for base in "ACGTN"},
+        sequence_sha256=hashlib.sha256(data.sequence.encode()).hexdigest(),
+    )
 ```
 
-### 2. 记忆系统
+工具注册记录风险、版本和 IO schema：
+
+```python
+registry.register(
+    name="sequence__stats",
+    description="Calculate length and GC fraction for a DNA sequence.",
+    input_model=SequenceStatsInput,
+    output_model=SequenceStatsOutput,
+    risk="read",
+    version="1.0.0",
+    handler=sequence_stats,
+)
+```
+
+请求大序列时，优先传 Artifact version id，而不是把 MB 级 FASTA 粘进模型上下文。工具读取该 Artifact 后将输入 hash、版本与输出写入 provenance。
+
+### 2. 以 Artifact 表达可复现结果
+
+```python
+# domain service 中的调用顺序
+input_version = artifacts.require_readable(frame.project_id, request.input_artifact_id)
+result = sequence_stats(SequenceStatsInput(sequence=read_fasta(input_version)))
+result_version = artifacts.write_json(
+    project_id=frame.project_id,
+    logical_path="analysis/sequence-stats.json",
+    value=result.model_dump(mode="json"),
+    run_id=run_id,
+    metadata={
+        "tool": "sequence__stats",
+        "tool_version": result.tool_version,
+        "input_artifact_version_id": input_version.id,
+    },
+)
+```
+
+UI 显示的是结构化结果和 Artifact 链接，而不是只显示“GC 含量为 52%”。用户可以下载 JSON、查看输入版本和重新运行参数。
+
+### 3. 建立可编辑、带来源的项目记忆
 
 ```python
 # src/scientex_agent/memory.py
+from __future__ import annotations
 
-"""Durable memory system for projects.
-
-Memories persist across conversations within a project.
-LLM can read and write memories via tools.
-"""
-
-from .metadata import MetadataStore
+from dataclasses import dataclass
+from typing import Literal
 
 
-class MemoryManager:
-    """Manages durable memories for a project.
-
-    Usage::
-
-        mgr = MemoryManager(metadata_store)
-        mgr.remember(project_id, "user", "User prefers Chinese replies")
-        memories = mgr.recall(project_id, category="user")
-    """
-
-    def __init__(self, metadata: MetadataStore) -> None:
-        self.metadata = metadata
-
-    def remember(self, project_id: str, category: str, content: str):
-        """Store a new memory. Deduplicates by content similarity."""
-        # Simple dedup: check exact match
-        existing = self.metadata.list_memories(project_id)
-        for mem in existing:
-            if mem.content.strip() == content.strip():
-                return mem  # Already stored
-
-        return self.metadata.create_memory(
-            project_id=project_id,
-            category=category,
-            content=content,
-        )
-
-    def recall(
-        self,
-        project_id: str,
-        *,
-        category: str | None = None,
-        query: str | None = None,
-        limit: int = 20,
-    ) -> list:
-        """Retrieve memories, optionally filtered."""
-        memories = self.metadata.list_memories(project_id)
-        if category:
-            memories = [m for m in memories if m.category == category]
-        if query:
-            query_lower = query.lower()
-            memories = [m for m in memories if query_lower in m.content.lower()]
-        return memories[-limit:]  # Most recent
-
-    def forget(self, memory_id: str) -> None:
-        self.metadata.delete_memory(memory_id)
-
-    def format_for_prompt(self, project_id: str, limit: int = 40) -> str:
-        """Format memories for injection into the system prompt."""
-        memories = self.recall(project_id, limit=limit)
-        if not memories:
-            return ""
-
-        lines = ["## Durable Memories", ""]
-        for m in memories:
-            lines.append(f"- [{m.category}] {m.content}")
-        return "\n".join(lines)
+@dataclass(frozen=True)
+class ProjectMemory:
+    id: str
+    project_id: str
+    kind: Literal["fact", "preference", "decision"]
+    content: str
+    source_artifact_version_id: str | None
+    source_message_id: str | None
+    confidence: float
+    status: Literal["proposed", "confirmed", "rejected", "expired"]
+    expires_at: int | None
 ```
 
-### 3. 事实验证系统
+写入路径应为“模型提出 → 用户确认或规则验证 → 保存”。例如 Agent 发现“样本 A 使用 hg38”时，先创建 `proposed` memory；用户在 Vue 中确认后才可作为后续默认上下文。每次检索仅返回当前 Project 中 `confirmed`、未过期、与任务相关的少量条目，并把 memory id 写入 Run provenance。
+
+### 4. 将结论与证据分开保存
 
 ```python
 # src/scientex_agent/verification.py
+from pydantic import BaseModel, Field
+from typing import Literal
 
-"""Fact-check and claim verification system."""
+
+class Evidence(BaseModel):
+    artifact_version_id: str | None = None
+    external_uri: str | None = None
+    quote: str = Field(max_length=1_000)
+    retrieved_at: int
+    relevance: float = Field(ge=0, le=1)
 
 
-class VerificationManager:
-    """Tracks verification of factual claims.
-
-    Usage::
-
-        vm = VerificationManager(metadata)
-        check = vm.record_claim(
-            frame_id="...",
-            claim="BRCA1 is located on chromosome 17",
-        )
-        vm.update_verdict(check.id, "confirmed", evidence="...", confidence=0.95)
-    """
-
-    def __init__(self, metadata) -> None:
-        self.metadata = metadata
-
-    def record_claim(self, frame_id: str, claim: str):
-        """Record a claim for later verification."""
-        return self.metadata.create_verification_check(
-            frame_id=frame_id,
-            claim=claim,
-            verdict="pending",
-            evidence="",
-            confidence=0.0,
-        )
-
-    def update_verdict(
-        self,
-        check_id: str,
-        verdict: str,  # "confirmed" | "refuted" | "uncertain"
-        evidence: str = "",
-        confidence: float = 0.0,
-    ):
-        self.metadata.update_verification_check(
-            id=check_id,
-            verdict=verdict,
-            evidence=evidence,
-            confidence=confidence,
-        )
-
-    def list_claims(self, frame_id: str) -> list:
-        return self.metadata.list_verification_checks(frame_id)
-
-    def pending_claims(self, frame_id: str) -> list:
-        return [
-            c for c in self.list_claims(frame_id)
-            if c.verdict == "pending"
-        ]
+class Claim(BaseModel):
+    text: str = Field(min_length=1, max_length=2_000)
+    status: Literal["draft", "supported", "insufficient_evidence", "contradicted", "needs_review"]
+    evidence: list[Evidence] = []
+    scope_note: str = ""
 ```
 
-### 4. Agent Profile 系统
+事实验证不是“让第二个 LLM 投票”。流程应是：提取可检验 claim → 检索/选择证据 → 记录来源版本与摘录 → 按可解释规则给出状态 → 高风险或矛盾情况交给专家。LLM 可以辅助提取和概述，但不能伪造引用或把未检索到的结果写成支持证据。
+
+### 5. 用 Profile 管理可复现运行配置
 
 ```python
-# src/scientex_agent/profiles.py
-
-"""Agent profile management — switchable personas with custom system prompts."""
-
-import json
-from pathlib import Path
-
-
-DEFAULT_PROFILES = [
-    {
-        "name": "default",
-        "displayName": "General Scientific Assistant",
-        "systemPrompt": (
-            "You are a general-purpose life-science research assistant. "
-            "Help with literature search, data analysis, and experimental design."
-        ),
-        "allowedSkills": [],  # empty = all skills allowed
-    },
-    {
-        "name": "bioinformatics",
-        "displayName": "Bioinformatics Specialist",
-        "systemPrompt": (
-            "You are a bioinformatics specialist. Focus on sequence analysis, "
-            "structural biology, and genomics. Use bio* tools extensively."
-        ),
-        "allowedSkills": ["alphafold2", "esmfold2", "variant-interpretation"],
-    },
-    {
-        "name": "literature-reviewer",
-        "displayName": "Literature Review Specialist",
-        "systemPrompt": (
-            "You are a scientific literature review specialist. "
-            "Systematically search, evaluate, and synthesize research papers. "
-            "Always check for publication date, journal reputation, and methodological quality."
-        ),
-        "allowedSkills": ["literature-review", "evidence-quality"],
-    },
-]
-
-
-class ProfileManager:
-    """Manage agent profiles."""
-
-    def __init__(self, data_dir: Path) -> None:
-        self._dir = data_dir / "profiles"
-        self._dir.mkdir(parents=True, exist_ok=True)
-        self._ensure_defaults()
-
-    def _ensure_defaults(self) -> None:
-        for profile in DEFAULT_PROFILES:
-            path = self._dir / f"{profile['name']}.json"
-            if not path.exists():
-                path.write_text(json.dumps(profile, indent=2))
-
-    def list_profiles(self) -> list[dict]:
-        profiles = []
-        for path in sorted(self._dir.glob("*.json")):
-            profiles.append(json.loads(path.read_text()))
-        return profiles
-
-    def get_profile(self, name: str) -> dict | None:
-        path = self._dir / f"{name}.json"
-        if path.exists():
-            return json.loads(path.read_text())
-        return None
-
-    def save_profile(self, name: str, data: dict) -> None:
-        path = self._dir / f"{name}.json"
-        path.write_text(json.dumps(data, indent=2))
+class AgentProfile(BaseModel):
+    id: str
+    version: str
+    provider: str
+    model: str
+    system_prompt_template: str
+    enabled_skill_ids: tuple[str, ...]
+    enabled_tool_names: tuple[str, ...]
+    max_tool_rounds: int = 8
 ```
+
+Profile 是可审查、版本化的运行配置，不是用户可随意提交的一段 prompt。每个 Run 固化 profile id/version、provider/model、Skill hash、tool version、输入 Artifact 与配置 hash；这样“重跑”才有明确含义。
 
 ## 验证
 
-```python
-# 测试生物工具
-from scientex_agent.bio_tools import BioToolManager
+```bash
+# 对确定性工具的输入/输出运行 schema 校验
+uv run pytest tests/domain/test_sequence_stats.py
 
-mgr = BioToolManager()
-tools = mgr.search_tools("genetics")
-print(f"Genetics tools: {len(tools)}")
-for t in tools:
-    print(f"  {t['domain']}: {t['description']}")
+# 将一个分析结果保存为 Artifact 并展示来源
+uv run scientex_agent tools call sequence__stats '{"sequence":"ACGTNN"}'
+uv run scientex_agent artifacts history --project PROJECT_ID analysis/sequence-stats.json
 
-# 测试记忆系统
-from scientex_agent.memory import MemoryManager
-from scientex_agent.metadata import MetadataStore
-
-meta = MetadataStore(Path("/tmp/scientex_agent-test/app.db"))
-meta.initialize()
-project = meta.create_project(name="Test")
-mm = MemoryManager(meta)
-mm.remember(project.id, "user", "User is a biologist studying cancer")
-memories = mm.recall(project.id, query="cancer")
-print(f"Cancer-related memories: {len(memories)}")
-
-# 测试 profile
-from scientex_agent.profiles import ProfileManager
-pm = ProfileManager(Path("/tmp/scientex_agent-test"))
-profiles = pm.list_profiles()
-print(f"Available profiles: {[p['displayName'] for p in profiles]}")
+# 记忆先提议再确认
+uv run scientex_agent memories propose --project PROJECT_ID --kind fact \
+  --content "Reference genome is GRCh38"
+uv run scientex_agent memories confirm MEMORY_ID
 ```
 
-## 当前局限性
+测试除了正确结果，还应覆盖：非法碱基、纯 N 序列的除零情况、相同输入 hash、Artifact provenance、跨 Project 记忆隔离、过期记忆不被检索、缺少 evidence 时 claim 不得标记为 `supported`。
 
-1. 生物工具需要逐个启动 MCP 服务器，启动延迟较高
-2. 记忆系统没有语义搜索（只做关键词匹配）
-3. Profile 系统没有 UI 切换界面
+## 深入理解
+
+### 科学工具的版本为什么重要
+
+同一个工具名在算法、参考数据库、阈值或依赖版本改变后可能给出不同结论。工具 version、容器 image digest、数据库 release、参数和输入 hash 应一同进入结果元数据；没有它们的“可复现”只是口号。
+
+### 隐私与敏感数据
+
+序列、患者信息和实验记录可能具有敏感性。最小化发送给 provider/MCP 的字段，允许项目禁用远程工具与长期记忆，并在界面显示数据离开本机前的目标与范围。真实医疗或临床使用还需要组织级合规评估，本项目不以该教程替代它。
+
+## 当前局限
+
+- 本章只提供一个确定性序列工具样例，未实现完整的 FASTQ、变异或结构生物学流水线。
+- Claim 状态辅助用户判断，不能替代同行评审、实验验证或临床决策。
+- 向量检索、远程文献库和多模态图表可以后续接入，但必须沿用 Artifact、来源和权限边界。
 
 ## 下一步
 
-→ [16-production-readiness.md](16-production-readiness.md)
+最后一章把测试、配置、安全、迁移、可观测性和发布流程收束为生产就绪门槛，并给出本地与服务端部署的不同边界。

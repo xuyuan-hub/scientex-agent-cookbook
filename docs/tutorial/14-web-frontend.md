@@ -1,559 +1,367 @@
-# Step 14: Web 前端（SPA）
+# Step 14: Web 前端（Vue 3 + TypeScript + Vite）
 
 ## 目标
 
-构建一个单页 Web 应用（SPA），提供对话界面、文件浏览器和项目管理。
+构建 Scientex 的单页 Web 应用：项目与 Frame 导航、流式对话、工具/审批状态和 Artifact 入口。前端使用 **Vue 3、TypeScript 与 Vite**，不再使用 vanilla JavaScript 维护手工 DOM、事件总线和可变全局状态。
 
 ## 前置条件
 
 - 完成 [13-cli.md](13-cli.md)
-- 前端基础（HTML/CSS/JS）
+- 完成 [11-http-api.md](11-http-api.md) 的 `/api/v1` 与 RunEvent SSE 契约
+- 已安装 Node.js LTS 与 pnpm（或 npm）
 
 ## 设计思路
 
-### 为什么不用前端框架
+### 为什么选择 Vue，而不是原生 JS
 
-对于本地桌面 agent 工具：
-- **打包简单**：静态文件直接内嵌在 Python 包里
-- **零构建**：不需要 webpack/vite/npm，直接写好就能用
-- **轻量**：整个前端只有几个文件，加载快
-- **易维护**：不需要同时维护 Python 和 Node.js 两套环境
+前端到这一步已经不只是“显示一段文本”：它需要维护项目选择、Frame 切换、流式消息、取消、错误、工具卡片和审批状态。Vue 的组件模型与响应式状态使这些状态有明确归属，TypeScript 让 API 变更在构建期暴露，Vite 提供快速开发与可复现产物。
 
-使用**模块化 vanilla JS**：
+```
+浏览器
+  └── Vue component tree
+        ├── Pinia stores：跨视图状态与异步操作
+        ├── API client：JSON 请求、Problem Details、SSE parser
+        └── router：URL → project / frame 视图
+                    │
+                    ▼
+              /api/v1（Step 11）
+```
+
+这不是把所有逻辑移到前端。科研数据、模型调用、工具权限、审批判断和 Markdown 安全策略仍在后端；Vue 只渲染已授权的状态和发起受控请求。
+
+### 组件与文件边界
+
 ```
 web/
-├── index.html              # 入口
-├── app.css                 # 样式
-├── app.js                  # 主入口
-├── core/
-│   ├── api.js              # HTTP 请求封装
-│   ├── state.js            # 应用状态管理
-│   └── router.js           # 客户端路由
-└── features/
-    ├── composer.js         # 消息输入组件
-    ├── conversation.js     # 对话渲染 + 流式
-    └── projects.js         # 项目管理
+├── package.json
+├── vite.config.ts
+├── src/
+│   ├── main.ts
+│   ├── App.vue
+│   ├── api/
+│   │   ├── client.ts          # fetch、Problem Details、DTO
+│   │   └── sse.ts             # POST + ReadableStream SSE parser
+│   ├── stores/
+│   │   ├── projects.ts
+│   │   └── conversation.ts
+│   ├── router/
+│   │   └── index.ts
+│   ├── views/
+│   │   ├── ProjectView.vue
+│   │   └── FrameView.vue
+│   └── components/
+│       ├── ConversationList.vue
+│       ├── MessageBubble.vue
+│       ├── ComposerForm.vue
+│       ├── ToolRunCard.vue
+│       └── ApprovalCard.vue
+└── tests/
 ```
 
-### 核心交互流程
-
-```
-用户输入消息
-  → composer.js 捕获事件
-  → api.js POST /frames/{id}/chat/stream (SSE)
-  → conversation.js 逐 token 渲染
-  → 工具调用卡片折叠/展开
-  → 自动滚动到底部
-```
+视图负责路由参数与布局，组件只接收 props / 发出事件，Pinia store 负责调用 API 和生命周期。不要让多个组件同时向同一 SSE stream 追加 DOM。
 
 ## 实现
 
-### 1. index.html
+### 1. 创建 Vue 工程
 
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Scientex</title>
-    <link rel="stylesheet" href="app.css">
-</head>
-<body>
-    <div id="app">
-        <!-- Sidebar -->
-        <aside id="sidebar">
-            <div id="project-list"></div>
-            <div id="frame-list"></div>
-        </aside>
+使用官方 `create-vue` 创建 Vite 工程，选择 TypeScript、Vue Router、Pinia、Vitest、ESLint 和 Prettier：
 
-        <!-- Main area -->
-        <main id="main">
-            <div id="conversation"></div>
-            <div id="composer">
-                <textarea id="message-input" rows="1"
-                    placeholder="Type a message... (Enter to send, Shift+Enter for new line)"></textarea>
-                <button id="send-btn">Send</button>
-            </div>
-        </main>
-    </div>
-
-    <script src="core/api.js"></script>
-    <script src="core/state.js"></script>
-    <script src="features/conversation.js"></script>
-    <script src="features/composer.js"></script>
-    <script src="features/projects.js"></script>
-    <script src="app.js"></script>
-</body>
-</html>
+```bash
+pnpm create vue@latest web
+cd web
+pnpm install
+pnpm dev
 ```
 
-### 2. core/api.js
+`create-vue` 生成的 lockfile 必须提交。不要使用维护模式的 Vue CLI，也不要通过 `<script>` 标签直接在 Python 静态目录中加载未打包模块。
 
-```javascript
-// core/api.js — HTTP client for Scientex API
-const API_BASE = '';
+关键依赖如下（实际版本由创建器与 lockfile 锁定）：
 
-const api = {
-    async get(path) {
-        const resp = await fetch(API_BASE + path);
-        if (!resp.ok) throw new Error(await resp.text());
-        return resp.json();
-    },
-
-    async post(path, body) {
-        const resp = await fetch(API_BASE + path, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-        });
-        if (!resp.ok) throw new Error(await resp.text());
-        return resp.json();
-    },
-
-    // SSE streaming
-    async streamChat(path, body, onToken, onToolStart, onToolEnd, onDone) {
-        const resp = await fetch(API_BASE + path, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-        });
-
-        const reader = resp.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n');
-            buffer = lines.pop() || '';
-
-            for (const line of lines) {
-                if (!line.startsWith('data: ')) continue;
-                try {
-                    const event = JSON.parse(line.slice(6));
-                    if (event.token && onToken) onToken(event.token);
-                    else if (event.tool_start && onToolStart) onToolStart(event.tool_start);
-                    else if (event.tool_end && onToolEnd) onToolEnd(event.tool_end);
-                    else if (event.done && onDone) onDone();
-                } catch (e) {
-                    // Skip malformed events
-                }
-            }
-        }
-    },
-};
+```json
+{
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc -b && vite build",
+    "test:unit": "vitest run",
+    "lint": "eslint .",
+    "format:check": "prettier --check ."
+  },
+  "dependencies": {
+    "pinia": "^3.0.0",
+    "vue": "^3.0.0",
+    "vue-router": "^4.0.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.0.0",
+    "typescript": "^5.0.0",
+    "vite": "^6.0.0",
+    "vue-tsc": "^2.0.0"
+  }
+}
 ```
 
-### 3. core/state.js
+版本范围仅表达最低代际；发布构建实际使用被提交的 lockfile。升级 Vue/Vite 时，在单独 PR 中运行 typecheck、unit test 和浏览器测试。
 
-```javascript
-// core/state.js — Simple reactive state management
-const state = {
-    currentProject: null,
-    currentFrame: null,
-    projects: [],
-    frames: [],
-    messages: [],
+### 2. 通过 Vite 代理访问后端
 
-    listeners: {},
+开发时让浏览器始终请求相对 `/api`，由 Vite 代理到 FastAPI；这样避免 CORS、cookie 和生产路径各写一套。
 
-    on(event, callback) {
-        if (!this.listeners[event]) this.listeners[event] = [];
-        this.listeners[event].push(callback);
+```ts
+// web/vite.config.ts
+import { fileURLToPath, URL } from 'node:url'
+import { defineConfig } from 'vite'
+import vue from '@vitejs/plugin-vue'
+
+export default defineConfig({
+  plugins: [vue()],
+  resolve: { alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) } },
+  server: {
+    proxy: {
+      '/api': {
+        target: 'http://127.0.0.1:8765',
+        changeOrigin: true,
+      },
     },
-
-    emit(event, data) {
-        (this.listeners[event] || []).forEach(cb => cb(data));
-    },
-
-    async loadProjects() {
-        this.projects = await api.get('/projects');
-        this.emit('projects-changed', this.projects);
-    },
-
-    async loadFrames(projectId) {
-        this.frames = await api.get(`/projects/${projectId}/frames`);
-        this.emit('frames-changed', this.frames);
-    },
-
-    async loadMessages(frameId) {
-        this.messages = await api.get(`/frames/${frameId}/messages`);
-        this.emit('messages-changed', this.messages);
-    },
-};
+  },
+})
 ```
 
-### 4. features/conversation.js
+生产构建中由同源 FastAPI/反向代理提供 `web/dist`，因此 API client 的 base URL 仍为空。静态文件 mount 必须在所有 `/api` router **之后**注册：
 
-```javascript
-// features/conversation.js — Conversation rendering with SSE streaming
+```python
+# api_server.py（生产模式，所有 API route 注册后）
+api.mount("/", StaticFiles(directory=settings.web_dist, html=True), name="web")
+```
 
-function renderMessage(msg) {
-    const div = document.createElement('div');
-    div.className = `message message-${msg.role}`;
+### 3. 写类型化 HTTP client
 
-    if (msg.role === 'user') {
-        div.innerHTML = `<div class="bubble user-bubble">${escapeHtml(msg.content)}</div>`;
-    } else if (msg.role === 'assistant') {
-        div.innerHTML = `<div class="bubble assistant-bubble">${escapeHtml(msg.content)}</div>`;
+```ts
+// web/src/api/client.ts
+export type ProblemDetail = {
+  type: string
+  title: string
+  status: number
+  detail: string
+  instance: string
+}
+
+export type Message = {
+  id: string
+  role: 'system' | 'user' | 'assistant' | 'tool'
+  content: string
+  created_at: number
+}
+
+export type RunEvent = {
+  run_id: string
+  seq: number
+  type:
+    | 'run.started'
+    | 'message.delta'
+    | 'tool.started'
+    | 'tool.completed'
+    | 'approval.required'
+    | 'run.completed'
+    | 'run.failed'
+  data: Record<string, unknown>
+}
+
+export class ApiError extends Error {
+  constructor(public readonly problem: ProblemDetail) {
+    super(problem.detail)
+  }
+}
+
+export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(`/api/v1${path}`, {
+    ...init,
+    headers: { Accept: 'application/json', ...init?.headers },
+  })
+  if (!response.ok) {
+    const problem = await response.json() as ProblemDetail
+    throw new ApiError(problem)
+  }
+  return response.json() as Promise<T>
+}
+```
+
+API 类型最终应由 Step 11 的 OpenAPI 文档生成或与之做契约测试。不要在每个组件里复制 URL、`fetch` 和错误处理。
+
+### 4. 正确解析 POST 的 SSE 流
+
+`EventSource` 不支持 POST body，且简单的 `split("\\n")` 会破坏跨 chunk 的 JSON 或多行 `data`。解析器以空行分隔完整 SSE message，保留 `event` 与所有 `data:` 行：
+
+```ts
+// web/src/api/sse.ts
+import type { RunEvent } from './client'
+
+export async function* runStream(
+  frameId: string,
+  payload: { content: string; skill_ids: string[]; idempotency_key: string },
+  signal: AbortSignal,
+): AsyncGenerator<RunEvent> {
+  const response = await fetch(`/api/v1/frames/${frameId}/runs/stream`, {
+    method: 'POST',
+    signal,
+    headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+    body: JSON.stringify(payload),
+  })
+  if (!response.ok || !response.body) throw new Error('Unable to start run')
+
+  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader()
+  let buffer = ''
+
+  while (true) {
+    const { value = '', done } = await reader.read()
+    buffer += value.replace(/\r\n/g, '\n')
+    let boundary: number
+    while ((boundary = buffer.indexOf('\n\n')) >= 0) {
+      const block = buffer.slice(0, boundary)
+      buffer = buffer.slice(boundary + 2)
+      const lines = block.split('\n')
+      const event = lines.find((line) => line.startsWith('event:'))?.slice(6).trim()
+      const data = lines
+        .filter((line) => line.startsWith('data:'))
+        .map((line) => line.slice(5).trimStart())
+        .join('\n')
+      if (event && data) yield JSON.parse(data) as RunEvent
     }
-
-    return div;
-}
-
-function renderConversation(messages) {
-    const container = document.getElementById('conversation');
-    container.innerHTML = '';
-    messages.forEach(msg => {
-        container.appendChild(renderMessage(msg));
-    });
-    container.scrollTop = container.scrollHeight;
-}
-
-// Streaming message rendering
-function createStreamingMessage() {
-    const container = document.getElementById('conversation');
-    const div = document.createElement('div');
-    div.className = 'message message-assistant streaming';
-    const bubble = document.createElement('div');
-    bubble.className = 'bubble assistant-bubble';
-    div.appendChild(bubble);
-    container.appendChild(div);
-    return {
-        append(text) {
-            bubble.textContent += text;
-            container.scrollTop = container.scrollHeight;
-        },
-        finalize() {
-            div.classList.remove('streaming');
-        },
-    };
-}
-
-// Tool call card
-function createToolCard(toolStart) {
-    const container = document.getElementById('conversation');
-    const card = document.createElement('div');
-    card.className = 'tool-card';
-    card.innerHTML = `
-        <div class="tool-card-header">
-            <span class="tool-icon">🔧</span>
-            <span class="tool-name">${escapeHtml(toolStart.name)}</span>
-            <span class="tool-status">Running...</span>
-        </div>
-        <div class="tool-card-body" style="display:none">
-            <pre>${JSON.stringify(toolStart.input, null, 2)}</pre>
-        </div>
-    `;
-    card.addEventListener('click', () => {
-        const body = card.querySelector('.tool-card-body');
-        body.style.display = body.style.display === 'none' ? 'block' : 'none';
-    });
-    container.appendChild(card);
-    return card;
-}
-
-function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
+    if (done) return
+  }
 }
 ```
 
-### 5. features/composer.js
+服务端终态事件是协议的一部分：收到 `run.completed` 或 `run.failed` 后 store 必须清除运行中状态。网络突然关闭而没有终态时，UI 显示“连接已断开”，并允许用户查询 Run 状态或安全重试同一个 idempotency key。
 
-```javascript
-// features/composer.js — Message input and send
+### 5. 用 Pinia 管理一次对话流
 
-function setupComposer() {
-    const input = document.getElementById('message-input');
-    const sendBtn = document.getElementById('send-btn');
+```ts
+// web/src/stores/conversation.ts
+import { defineStore } from 'pinia'
+import { ref } from 'vue'
+import { apiFetch, type Message, type RunEvent } from '@/api/client'
+import { runStream } from '@/api/sse'
 
-    async function send() {
-        const content = input.value.trim();
-        if (!content) return;
-        if (!state.currentFrame) {
-            alert('Please select or create a project first.');
-            return;
-        }
+export const useConversationStore = defineStore('conversation', () => {
+  const messages = ref<Message[]>([])
+  const activeRunId = ref<string | null>(null)
+  const aborter = ref<AbortController | null>(null)
+  const error = ref<string | null>(null)
 
-        input.value = '';
-        input.disabled = true;
-        sendBtn.disabled = true;
+  async function load(frameId: string) {
+    messages.value = await apiFetch<Message[]>(`/frames/${frameId}/messages`)
+  }
 
-        // Render user message
-        const container = document.getElementById('conversation');
-        container.appendChild(renderMessage({ role: 'user', content }));
-
-        // Start streaming
-        const streamMsg = createStreamingMessage();
-
-        await api.streamChat(
-            `/frames/${state.currentFrame.id}/chat/stream`,
-            { content },
-            // onToken
-            (token) => streamMsg.append(token),
-            // onToolStart
-            (tool) => createToolCard(tool),
-            // onToolEnd
-            null,
-            // onDone
-            () => {
-                streamMsg.finalize();
-                input.disabled = false;
-                sendBtn.disabled = false;
-                input.focus();
-            },
-        );
+  async function send(frameId: string, content: string) {
+    if (activeRunId.value || !content.trim()) return
+    error.value = null
+    messages.value.push({ id: crypto.randomUUID(), role: 'user', content, created_at: Date.now() })
+    const draft: Message = {
+      id: `draft-${crypto.randomUUID()}`, role: 'assistant', content: '', created_at: Date.now(),
     }
+    messages.value.push(draft)
+    aborter.value = new AbortController()
+    activeRunId.value = 'pending'
 
-    sendBtn.addEventListener('click', send);
-    input.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' && !e.shiftKey) {
-            e.preventDefault();
-            send();
-        }
-    });
-}
-```
-
-### 6. app.css（核心样式）
-
-```css
-:root {
-    --bg-primary: #1e1e2e;
-    --bg-secondary: #181825;
-    --bg-surface: #313244;
-    --text-primary: #cdd6f4;
-    --text-secondary: #a6adc8;
-    --accent: #89b4fa;
-    --border: #45475a;
-    --user-bubble: #45475a;
-    --assistant-bubble: #313244;
-}
-
-* {
-    margin: 0;
-    padding: 0;
-    box-sizing: border-box;
-}
-
-body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    background: var(--bg-primary);
-    color: var(--text-primary);
-    height: 100vh;
-    overflow: hidden;
-}
-
-#app {
-    display: flex;
-    height: 100vh;
-}
-
-#sidebar {
-    width: 260px;
-    background: var(--bg-secondary);
-    border-right: 1px solid var(--border);
-    padding: 16px;
-    overflow-y: auto;
-}
-
-#main {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-}
-
-#conversation {
-    flex: 1;
-    overflow-y: auto;
-    padding: 24px;
-}
-
-.message {
-    margin-bottom: 16px;
-    max-width: 80%;
-}
-
-.message-user {
-    margin-left: auto;
-}
-
-.message-assistant {
-    margin-right: auto;
-}
-
-.bubble {
-    padding: 12px 16px;
-    border-radius: 12px;
-    line-height: 1.5;
-    white-space: pre-wrap;
-}
-
-.user-bubble {
-    background: var(--user-bubble);
-}
-
-.assistant-bubble {
-    background: var(--assistant-bubble);
-}
-
-.streaming .assistant-bubble::after {
-    content: '▊';
-    animation: blink 1s step-end infinite;
-}
-
-@keyframes blink {
-    50% { opacity: 0; }
-}
-
-#composer {
-    padding: 16px 24px;
-    border-top: 1px solid var(--border);
-    display: flex;
-    gap: 12px;
-}
-
-#message-input {
-    flex: 1;
-    background: var(--bg-surface);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 12px;
-    color: var(--text-primary);
-    resize: none;
-    font-family: inherit;
-    font-size: 14px;
-}
-
-#message-input:focus {
-    outline: none;
-    border-color: var(--accent);
-}
-
-#send-btn {
-    background: var(--accent);
-    color: var(--bg-primary);
-    border: none;
-    border-radius: 8px;
-    padding: 0 20px;
-    cursor: pointer;
-    font-weight: 600;
-}
-
-#send-btn:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-}
-
-.tool-card {
-    background: var(--bg-surface);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 8px 12px;
-    margin-bottom: 12px;
-    cursor: pointer;
-    font-size: 13px;
-}
-
-.tool-card-header {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-}
-
-.tool-status {
-    color: var(--text-secondary);
-    font-size: 12px;
-}
-```
-
-### 7. app.js
-
-```javascript
-// app.js — Application entry point
-document.addEventListener('DOMContentLoaded', async () => {
-    setupComposer();
-
-    // Load initial data
-    await state.loadProjects();
-    if (state.projects.length > 0) {
-        state.currentProject = state.projects[0];
-        await state.loadFrames(state.currentProject.id);
-        if (state.frames.length > 0) {
-            state.currentFrame = state.frames[0];
-            await state.loadMessages(state.currentFrame.id);
-            renderConversation(state.messages);
-        }
+    try {
+      for await (const event of runStream(frameId, {
+        content,
+        skill_ids: [],
+        idempotency_key: crypto.randomUUID(),
+      }, aborter.value.signal)) {
+        applyEvent(event, draft)
+      }
+    } catch (cause) {
+      if (!aborter.value?.signal.aborted) error.value = String(cause)
+    } finally {
+      activeRunId.value = null
+      aborter.value = null
     }
+  }
 
-    // Listen for state changes
-    state.on('projects-changed', (projects) => {
-        // Re-render project list
-    });
+  function applyEvent(event: RunEvent, draft: Message) {
+    activeRunId.value = event.run_id
+    if (event.type === 'message.delta') draft.content += String(event.data.text ?? '')
+    if (event.type === 'run.failed') error.value = String(event.data.message ?? 'Run failed')
+  }
 
-    state.on('messages-changed', (messages) => {
-        renderConversation(messages);
-    });
-});
+  function cancel() {
+    aborter.value?.abort()
+  }
+
+  return { messages, activeRunId, error, load, send, cancel }
+})
 ```
+
+真实实现还应把 `tool.*` 和 `approval.required` 写入各自的响应式列表，而不是塞进 Markdown 文本。切换 Frame 前取消旧 stream，或用 run id 验证事件仍属于当前视图，避免慢网络把 A Frame 的 token 写进 B Frame。
+
+### 6. 用组件渲染，而非操作 DOM
+
+```vue
+<!-- web/src/components/ComposerForm.vue -->
+<script setup lang="ts">
+import { ref } from 'vue'
+
+const emit = defineEmits<{ send: [content: string]; cancel: [] }>()
+defineProps<{ busy: boolean }>()
+const content = ref('')
+
+function submit() {
+  const value = content.value.trim()
+  if (!value) return
+  emit('send', value)
+  content.value = ''
+}
+</script>
+
+<template>
+  <form class="composer" @submit.prevent="submit">
+    <label class="sr-only" for="message">发送消息</label>
+    <textarea id="message" v-model="content" :disabled="busy"
+      placeholder="输入消息；Enter 发送，Shift+Enter 换行"
+      @keydown.enter.exact.prevent="submit" />
+    <button v-if="busy" type="button" @click="emit('cancel')">停止生成</button>
+    <button v-else type="submit">发送</button>
+  </form>
+</template>
+```
+
+所有用户文本默认通过插值 `{{ message.content }}` 渲染。若需要 Markdown，先在前端使用严格 allowlist 的 sanitizer，链接使用安全协议和 `rel="noopener noreferrer"`；绝不能将模型输出直接交给 `v-html`。
 
 ## 验证
 
 ```bash
-# 启动服务
-uv run scientex_agent run-server
+# 终端 A：后端
+uv run uvicorn scientex_agent.api_server:create_api --factory --reload
 
-# 浏览器访问
-open http://127.0.0.1:8765
+# 终端 B：Vue 开发服务器
+cd web
+pnpm dev
+
+# 发布前
+pnpm lint
+pnpm build
+pnpm test:unit
 ```
 
-预期效果：
-- 左侧边栏显示项目列表
-- 中间对话区域显示历史消息
-- 底部输入框可以发送消息
-- 消息流式出现，带闪烁光标
-- 工具调用显示为可折叠卡片
+手动验证至少包括：刷新后从 URL 恢复 Project/Frame、流式 token 不丢失、取消按钮停止 UI、工具卡片和审批卡片可操作、断网显示可恢复错误、键盘可完成发送与焦点移动。使用 Vitest 测 SSE parser 和 store；使用 Playwright 覆盖真实代理下的聊天、审批和 Artifact 下载。
 
 ## 深入理解
 
-### 前端构建策略
+### 响应式状态的归属
 
-对于本地桌面应用，有两种分发方式：
+组件本地状态（textarea 内容、折叠卡片）留在组件内；跨组件且有副作用的状态（当前 Frame、消息、active run）留在 Pinia；后端是 Project/Frame/Artifact 的权威来源。这个分层让组件可独立测试，也避免“某个模块偷偷改全局对象”造成的流式竞态。
 
-1. **嵌入式**（当前方案）：静态文件打包在 Python 包里
-   ```python
-   api.mount("/", StaticFiles(directory=str(web_dir), html=True))
-   ```
-   优点：一个 `uv run` 全搞定。缺点：前端修改需要了解 Python 包结构。
+### 前端安全与可访问性
 
-2. **独立部署**：前端从 CDN 加载或独立开发服务器
-   优点：前后端完全分离。缺点：增加部署复杂度。
-
-对于本地工具，嵌入式是最佳选择。
-
-### 为什么流式渲染需要特殊处理
-
-```
-同步渲染：  等所有消息下载完 → 一次性渲染
-流式渲染：  收到一个 token → 立即追加到 DOM
-```
-
-DOM 操作是昂贵的。对于高速流式（100+ tokens/秒），应该：
-- 使用 `requestAnimationFrame` 批量更新
-- 或者使用 `DocumentFragment` 缓冲
+工具调用、运行错误和审批状态不能只用颜色表达，要有文字、图标、ARIA label 和可见焦点。对话自动滚动仅在用户原本位于底部时发生，避免阅读历史时被 token 拉回底部。错误消息采用 `aria-live="polite"`，但 token 逐字输出不要每次都打断屏幕阅读器。
 
 ## 当前局限
 
-1. 没有 Markdown 渲染（代码块、表格、公式）
-2. 没有文件上传/预览
-3. 移动端适配不完整
+- 初版是单用户 SPA，不处理离线编辑、多人实时协作或复杂权限路由。
+- SSE 断线后还没有按 `Last-Event-ID` 重放；UI 通过查询 Run 终态恢复。
+- 前端不负责科学结论验证；它只展示 Step 15 产生的证据与状态。
 
 ## 下一步
 
-→ [15-domain-features.md](15-domain-features.md)
+下一章在稳定的 Agent、Artifact 和 Vue UI 之上加入科研领域能力：可复现分析工具、经过同意的记忆、证据和验证结果。
