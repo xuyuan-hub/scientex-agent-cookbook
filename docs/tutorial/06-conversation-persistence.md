@@ -57,6 +57,10 @@ models.py       ← 纯数据模型（dataclass）
 
 ## 实现
 
+本章完成后的独立代码快照在
+[code/06-conversation-persistence](../../code/06-conversation-persistence)。你可以在完成 Step 05 后，
+直接复制这个目录来核对自己的实现；其中也包含本章的回归测试。
+
 ### 1. 创建 src/scientex_agent/models.py
 
 ```python
@@ -273,7 +277,7 @@ def _row_to_project(row: sqlite3.Row) -> Project:
     return Project(
         id=row["id"], name=row["name"], description=row["description"],
         context=row["context"] or "",
-        memory_enabled=bool(row.get("memory_enabled", True)),
+        memory_enabled=bool(row["memory_enabled"]),
         created_at=row["created_at"], updated_at=row["updated_at"],
     )
 
@@ -281,13 +285,13 @@ def _row_to_project(row: sqlite3.Row) -> Project:
 def _row_to_frame(row: sqlite3.Row) -> Frame:
     return Frame(
         id=row["id"], project_id=row["project_id"],
-        parent_frame_id=row.get("parent_frame_id"),
-        root_frame_id=row.get("root_frame_id", ""),
-        name=row.get("name", ""), task_summary=row.get("task_summary", ""),
-        status=row.get("status", "active"),
-        provider=row.get("provider"), model=row.get("model"),
-        created_at=row.get("created_at", 0), updated_at=row.get("updated_at", 0),
-        completed_at=row.get("completed_at"),
+        parent_frame_id=row["parent_frame_id"],
+        root_frame_id=row["root_frame_id"],
+        name=row["name"], task_summary=row["task_summary"],
+        status=row["status"],
+        provider=row["provider"], model=row["model"],
+        created_at=row["created_at"], updated_at=row["updated_at"],
+        completed_at=row["completed_at"],
     )
 
 
@@ -295,8 +299,8 @@ def _row_to_message(row: sqlite3.Row) -> Message:
     return Message(
         frame_id=row["frame_id"], idx=row["idx"], role=row["role"],
         content=_deserialize_content(row["content"]),
-        provider_message_id=row.get("provider_message_id"),
-        created_at=row.get("created_at", 0),
+        provider_message_id=row["provider_message_id"],
+        created_at=row["created_at"],
     )
 
 
